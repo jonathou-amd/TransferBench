@@ -50,7 +50,7 @@ THE SOFTWARE.
 #pragma once
 
 // Two backends are supported:
-// AMD's Tensor Data Mover (gfx1250) and NVIDIA's cp.async.bulk / TMA (Hopper, sm_90+). 
+// AMD's Tensor Data Mover (gfx1250, gfx1260) and NVIDIA's cp.async.bulk / TMA (Hopper, sm_90+).
 // The active backend is chosen from the compiler in use (see the AVAILABILITY block below).
 #if defined(__CUDACC__) || defined(__NVCC__) || defined(__CUDA__)
 #  include <cuda_runtime.h>
@@ -88,7 +88,7 @@ THE SOFTWARE.
 
 // ---- backend selection -----------------------------------------------------
 // TDM_PLATFORM_NV is a host-evaluable proxy for "this is the NVIDIA toolchain".
-// Exactly one backend is enabled: TDM_BACKEND_AMD (gfx1250 TDM) or
+// Exactly one backend is enabled: TDM_BACKEND_AMD (gfx1250/gfx1260 TDM) or
 // TDM_BACKEND_NV (Hopper+ cp.async.bulk). TDM_SUPPORTED is their OR.
 #if defined(__CUDACC__) || defined(__NVCC__) || defined(__CUDA__)
 #  define TDM_PLATFORM_NV 1
@@ -112,10 +112,9 @@ THE SOFTWARE.
 #  else
 #    define TDM_TOOLCHAIN_AVAILABLE 0
 #  endif
-#  if defined(__gfx1250__) && \
+#  if (defined(__gfx1250__) || defined(__gfx1260__)) && \
       __has_builtin(__builtin_amdgcn_tensor_load_to_lds) && \
       TDM_TOOLCHAIN_AVAILABLE
-                                  /* extend: || (defined(__gfxNNNN__) && ...) */
 #    define TDM_BACKEND_AMD 1
 #  else
 #    define TDM_BACKEND_AMD 0
@@ -149,6 +148,16 @@ THE SOFTWARE.
 #endif
 
 namespace tdm {
+
+namespace detail {
+#if !TDM_PLATFORM_NV
+inline bool GcnArchNameHasPrefix(char const* arch, char const* prefix)
+{
+  while (*prefix && *arch == *prefix) { ++arch; ++prefix; }
+  return *prefix == '\0';
+}
+#endif
+} // namespace detail
 
 // ============================================================================
 //  PUBLIC API
@@ -186,15 +195,15 @@ __host__ __device__ inline bool IsTdmCopySupported(int deviceId = 0) {
 #else
     hipDeviceProp_t prop;
     if (hipGetDeviceProperties(&prop, deviceId) != hipSuccess) return false;
-    // gcnArchName looks like "gfx1250:sramecc+:xnack-"; match the arch prefix.
+    // gcnArchName looks like "gfx1260:sramecc+:xnack-"; match the arch prefix.
     // Keep this list in sync with the TDM_SUPPORTED arch condition above.
-    const char* arch = prop.gcnArchName;
-    const char* p    = "gfx1250";
-    while (*p && *arch == *p) { ++arch; ++p; }
+    char const* arch = prop.gcnArchName;
+    bool const archOk = detail::GcnArchNameHasPrefix(arch, "gfx1250") ||
+                        detail::GcnArchNameHasPrefix(arch, "gfx1260");
     // Require BOTH a TDM-capable arch AND a toolchain that actually built TDM
     // (otherwise the device pass emitted a no-op stub and enabling the path here
     // would silently produce wrong results).
-    return TDM_TOOLCHAIN_AVAILABLE && (*p == '\0');
+    return TDM_TOOLCHAIN_AVAILABLE && archOk;
 #endif
 }
 

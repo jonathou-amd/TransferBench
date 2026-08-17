@@ -82,6 +82,7 @@ THE SOFTWARE.
 #endif
 
 #include "tdmCopy.h"
+#include "Simulation.hpp"
 /// @endcond
 
 // Batched DMA executor is only supported with HIP >= 7.1 and CUDA 12.8
@@ -437,6 +438,12 @@ namespace TransferBench
    * @returns Value of the attribute
    */
   std::string GetStrAttribute(StrAttribute attribute);
+
+  /** True when FFM / pre-silicon simulation mode is active (TB_SIMULATION=1). */
+  inline bool IsSimulationEnabled()
+  {
+    return Simulation::IsEnabled();
+  }
 
   /**
    * Returns information about number of available Executors given an executor type
@@ -1372,13 +1379,15 @@ namespace {
   // Enable peer access between two GPUs
   static ErrResult EnablePeerAccess(int const deviceId, int const peerDeviceId)
   {
+    if (Simulation::IsEnabled()) return ERR_NONE;
+
     int canAccess;
     ERR_CHECK(hipDeviceCanAccessPeer(&canAccess, deviceId, peerDeviceId));
     if (!canAccess)
       return {ERR_FATAL, "Peer access is unavailable between GPU devices %d to %d."
                          "For AMD hardware, check IOMMU configuration", peerDeviceId, deviceId};
 
-    ERR_CHECK(hipSetDevice(deviceId));
+    ERR_CHECK(Simulation::SetLogicalDevice(deviceId));
     hipError_t error = hipDeviceEnablePeerAccess(peerDeviceId, 0);
     if (error != hipSuccess && error != hipErrorPeerAccessAlreadyEnabled) {
       return {ERR_FATAL,
@@ -1471,7 +1480,8 @@ namespace {
   static std::string GetGpuBdf(int gpuIndex)
   {
     char buf[64] = "";
-    if (hipDeviceGetPCIBusId(buf, sizeof(buf), gpuIndex) != hipSuccess) return "";
+    int const dev = Simulation::PhysicalDeviceForQuery(gpuIndex);
+    if (hipDeviceGetPCIBusId(buf, sizeof(buf), dev) != hipSuccess) return "";
     return std::string(buf);
   }
 
@@ -1501,7 +1511,8 @@ namespace {
     return ERR_NONE;
 #else
     int isLargeBar = 0;
-    ERR_CHECK(hipDeviceGetAttribute(&isLargeBar, hipDeviceAttributeIsLargeBar, memDevice.memIndex));
+    int const physDev = Simulation::PhysicalDeviceForQuery(memDevice.memIndex);
+    ERR_CHECK(hipDeviceGetAttribute(&isLargeBar, hipDeviceAttributeIsLargeBar, physDev));
     hostAccessible = (isLargeBar != 0);
     return ERR_NONE;
 #endif
@@ -1527,9 +1538,8 @@ namespace {
       // Set NUMA policy prior to call to hipHostMalloc
       numa_set_preferred(deviceIdx);
     } else if (IsGpuMemType(memType)) {
-      // Switch to the appropriate GPU
-      // IMP: if the remapping above changes, remember to modify this!
-      ERR_CHECK(hipSetDevice(deviceIdx));
+      // Switch to the appropriate GPU (physical device 0 when simulating)
+      ERR_CHECK(Simulation::SetLogicalDevice(deviceIdx));
     }
 
     // If memHandle is provided, allocate sharable memory
@@ -1625,6 +1635,19 @@ namespace {
       numa_set_preferred(-1);
     } else if (IsGpuMemType(memType)) {
 
+      if (Simulation::IsEnabled()) {
+        if (memHandle != NULL) {
+          return {ERR_FATAL, "Sharable GPU memory is not supported in TB simulation mode"};
+        }
+        if (actualBytes != NULL) *actualBytes = numBytes;
+        if (!Simulation::AllocateGpu(deviceIdx, numBytes, memPtr)) {
+          return {ERR_FATAL, "Simulation GPU memory allocation failed for GPU %d", deviceIdx};
+        }
+        ERR_CHECK(hipMemset(*memPtr, 0, numBytes));
+        ERR_CHECK(hipDeviceSynchronize());
+        return ERR_NONE;
+      }
+
       if (memType == MEM_GPU) {
         // Allocate GPU memory on appropriate device
         ERR_CHECK(hipMalloc((void**)memPtr, numBytes));
@@ -1677,7 +1700,8 @@ namespace {
       }
       case MEM_GPU : case MEM_GPU_FINE: case MEM_GPU_UNCACHED: case MEM_MANAGED:
       {
-        ERR_CHECK(hipFree(memPtr));
+        if (!Simulation::OwnsPointer(memPtr))
+          ERR_CHECK(hipFree(memPtr));
         break;
       }
       default:
@@ -2163,7 +2187,7 @@ namespace {
       }
     }
 
-    // Check TDM options (TDM-capable hardware: gfx1250 on AMD, sm_90+ on NVIDIA)
+    // Check TDM options (TDM-capable hardware: gfx1250/gfx1260 on AMD, sm_90+ on NVIDIA)
     if (cfg.tdm.blockSize <= 0 || cfg.tdm.blockSize % 32 || cfg.tdm.blockSize > MAX_BLOCKSIZE)
       errors.push_back({ERR_FATAL,
                         "[tdm.blockSize] must be a positive multiple of 32 less than or equal to %d",
@@ -2175,7 +2199,8 @@ namespace {
       int const numGpus = GetNumExecutors(EXE_GPU_TDM);
       for (int i = 0; i < numGpus; i++) {
         int deviceMax = 0;
-        if (hipDeviceGetAttribute(&deviceMax, hipDeviceAttributeMaxSharedMemoryPerBlock, i) == hipSuccess) {
+        int const physDev = Simulation::PhysicalDeviceForQuery(i);
+        if (hipDeviceGetAttribute(&deviceMax, hipDeviceAttributeMaxSharedMemoryPerBlock, physDev) == hipSuccess) {
           if (cfg.tdm.ldsBytes > deviceMax) {
             errors.push_back({ERR_FATAL,
                 "[tdm.ldsBytes] (%d) exceeds device max shared memory per block (%d)",
@@ -2186,7 +2211,7 @@ namespace {
           }
         } else {
           errors.push_back({ERR_FATAL,
-              "Unable to query max amount of shared memory per block on GPU %%d\n", i});
+              "Unable to query max amount of shared memory per block on GPU %d\n", i});
         }
       }
     }
@@ -2210,7 +2235,8 @@ namespace {
     // Check for largeBar enablement on GPUs
     for (int i = 0; i < numGpus; i++) {
       int isLargeBar = 0;
-      hipError_t err = hipDeviceGetAttribute(&isLargeBar, hipDeviceAttributeIsLargeBar, i);
+      int const physDev = Simulation::PhysicalDeviceForQuery(i);
+      hipError_t err = hipDeviceGetAttribute(&isLargeBar, hipDeviceAttributeIsLargeBar, physDev);
       if (err != hipSuccess) {
         errors.push_back({ERR_FATAL, "Unable to query if GPU %d has largeBAR enabled", i});
       } else if (!isLargeBar) {
@@ -2403,9 +2429,9 @@ namespace {
           hasFatalError = true;
           break;
         }
-        if (!tdm::IsTdmCopySupported(t.exeDevice.exeIndex)) {
+        if (!tdm::IsTdmCopySupported(Simulation::PhysicalDeviceForQuery(t.exeDevice.exeIndex))) {
           errors.push_back({ERR_FATAL,
-                            "Transfer %d: GPU TDM kernel requires TDM-capable hardware (gfx1250 or NVIDIA sm_90+), but GPU %d is not supported",
+                            "Transfer %d: GPU TDM kernel requires TDM-capable hardware (gfx1250, gfx1260, or NVIDIA sm_90+), but GPU %d is not supported",
                             i, t.exeDevice.exeIndex});
           hasFatalError = true;
         }
@@ -4028,7 +4054,7 @@ namespace {
                               t.numBytes, output);
           }
         } else {
-          ERR_CHECK(hipSetDevice(t.dsts[dstIdx].memIndex));
+          ERR_CHECK(Simulation::SetLogicalDevice(t.dsts[dstIdx].memIndex));
           if (verbose) {
             System::Get().Log("[INFO] Validation memcpy: transfer %d DST[%d] %s%d->host  %zu bytes  src=%p dst=%p\n",
                               transferIdx, dstIdx,
@@ -4228,7 +4254,7 @@ namespace {
       hipError_t exportErr = hipSuccess;
       const char* exportStep = "hipSetDevice";
       if (memDevice.memRank == GetRank()) {
-        exportErr = hipSetDevice(memDevice.memIndex);
+        exportErr = Simulation::SetLogicalDevice(memDevice.memIndex);
         if (exportErr == hipSuccess) {
           exportStep = "hipMemExportToShareableHandle";
           exportErr = hipMemExportToShareableHandle(&fabricHandle, *memHandle, hipMemHandleTypeFabric, 0);
@@ -4245,7 +4271,7 @@ namespace {
       hipError_t importErr = hipSuccess;
       const char* importStep = "hipSetDevice";
       if (exeDevice.exeRank == GetRank()) {
-        importErr = hipSetDevice(exeDevice.exeIndex);
+        importErr = Simulation::SetLogicalDevice(exeDevice.exeIndex);
         if (importErr == hipSuccess) {
           importStep = "hipMemImportFromShareableHandle";
           importErr = hipMemImportFromShareableHandle(memHandle, (void*)&fabricHandle, hipMemHandleTypeFabric);
@@ -4433,7 +4459,7 @@ namespace {
 
     // Prepare additional requirements for GPU-based executors
     if (IsGpuExeType(exeDevice.exeType) && exeDevice.exeRank == localRank) {
-      ERR_CHECK(hipSetDevice(exeDevice.exeIndex));
+      ERR_CHECK(Simulation::SetLogicalDevice(exeDevice.exeIndex));
 
       // Determine how many streams to use
       int const numStreamsToUse = (exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA ||
@@ -4470,7 +4496,8 @@ namespace {
         if (cfg.tdm.ldsBytes == 0) {
           int ldsMaxBytes;
           ERR_CHECK(hipDeviceGetAttribute(&ldsMaxBytes,
-                                          hipDeviceAttributeMaxSharedMemoryPerBlock, exeDevice.exeIndex));
+                                          hipDeviceAttributeMaxSharedMemoryPerBlock,
+                                          Simulation::PhysicalDeviceForQuery(exeDevice.exeIndex)));
           exeInfo.ldsBytesActual = static_cast<uint32_t>(ldsMaxBytes);
         } else {
           exeInfo.ldsBytesActual = cfg.tdm.ldsBytes;
@@ -4499,7 +4526,7 @@ namespace {
       exeInfo.wallClockRate = 1000000;
 #else
       ERR_CHECK(hipDeviceGetAttribute(&exeInfo.wallClockRate, hipDeviceAttributeWallClockRate,
-                                      exeDevice.exeIndex));
+                                      Simulation::PhysicalDeviceForQuery(exeDevice.exeIndex)));
 #endif
       int transferOffset = 0;
       if (cfg.general.useMultiStream || cfg.gfx.blockOrder == 0) {
@@ -4546,7 +4573,7 @@ namespace {
       }
 
       // Copy sub executor parameters to GPU
-      ERR_CHECK(hipSetDevice(exeDevice.exeIndex));
+      ERR_CHECK(Simulation::SetLogicalDevice(exeDevice.exeIndex));
       if (verbose) {
         System::Get().Log("[INFO] SubExecParam upload: GPU%d  %zu bytes (%zu params)  host=%p dev=%p\n",
                           exeDevice.exeIndex,
@@ -4559,7 +4586,8 @@ namespace {
                           exeInfo.subExecParamCpu.data(),
                           exeInfo.totalSubExecs * sizeof(SubExecParam),
                           hipMemcpyHostToDevice));
-      ERR_CHECK(hipDeviceSynchronize());
+      if (!Simulation::RocapCaptureMode())
+        ERR_CHECK(hipDeviceSynchronize());
     }
 
     // Prepare for NIC-based executors
@@ -5187,10 +5215,10 @@ namespace {
   __global__ void __launch_bounds__(LAUNCH_BOUND)
     GpuReduceKernel(SubExecParam* params, int seType, int waveOrder, int numSubIterations)
   {
-    int64_t startCycle;
-    // For warp-level, each warp's first thread records timing; for threadblock-level, only first thread of block
-    bool shouldRecordTiming = (seType == 1) ? (threadIdx.x % warpSize == 0) : (threadIdx.x == 0);
-    if (shouldRecordTiming) startCycle = GetTimestamp();
+//    int64_t startCycle;
+//    // For warp-level, each warp's first thread records timing; for threadblock-level, only first thread of block
+//    bool shouldRecordTiming = (seType == 1) ? (threadIdx.x % warpSize == 0) : (threadIdx.x == 0);
+//    if (shouldRecordTiming) startCycle = GetTimestamp();
 
     // seType: 0=threadblock, 1=warp
     int subExecIdx;
@@ -5209,12 +5237,12 @@ namespace {
     // For warp-level dispatch, inactive warps should return early
     if (seType == 1 && p.N == 0) return;
 
-    // Filter by XCC
-#if !defined(__NVCC__)
-    int32_t xccId;
-    GetXccId(xccId);
-    if (p.preferredXccId != -1 && xccId != p.preferredXccId) return;
-#endif
+//    // Filter by XCC
+//#if !defined(__NVCC__)
+//    int32_t xccId;
+//    GetXccId(xccId);
+//    if (p.preferredXccId != -1 && xccId != p.preferredXccId) return;
+//#endif
 
     // Collect data information
     int32_t const  numSrcs  = p.numSrcs;
@@ -5335,32 +5363,32 @@ namespace {
         }
       }
 
-      // Wait for all threads to finish this subiteration
-      if (seType == 1) {
-        // For warp-level, sync within warp only
-#if defined(__HIP_PLATFORM_AMD__) && (HIP_VERSION_MAJOR < 7)
-        __builtin_amdgcn_wave_barrier();
-#else
-        __syncwarp();
-#endif
-      } else {
-        // For threadblock-level, sync all threads
-        __syncthreads();
-      }
+//      // Wait for all threads to finish this subiteration
+//      if (seType == 1) {
+//        // For warp-level, sync within warp only
+//#if defined(__HIP_PLATFORM_AMD__) && (HIP_VERSION_MAJOR < 7)
+//        __builtin_amdgcn_wave_barrier();
+//#else
+//        __syncwarp();
+//#endif
+//      } else {
+//        // For threadblock-level, sync all threads
+//        __syncthreads();
+//      }
 
       // Allows for numSubiterations == 0 to run infinitely
       if (++subIterations == numSubIterations) break;
     }
 
-    if (shouldRecordTiming) {
-      // Previous sync ensures data from all threads in this subexecutor has landed in cache
-      // so only one thread needs to do system level threadfence.
-      __threadfence_system();
-      p.stopCycle  = GetTimestamp();
-      p.startCycle = startCycle;
-      GetHwId(p.hwId);
-      GetXccId(p.xccId);
-    }
+//    if (shouldRecordTiming) {
+//      // Previous sync ensures data from all threads in this subexecutor has landed in cache
+//      // so only one thread needs to do system level threadfence.
+//      __threadfence_system();
+//      p.stopCycle  = GetTimestamp();
+//      p.startCycle = startCycle;
+//      GetHwId(p.hwId);
+//      GetXccId(p.xccId);
+//    }
   }
 
   // Must match ordering in GfxKernelType
@@ -5489,6 +5517,7 @@ namespace {
                           params, cfg.gfx.seType, cfg.gfx.waveOrder, cfg.general.numSubIterations);
 #endif
 
+    // Always wait for the kernel on its stream so roccap can finalize the trace.
     ERR_CHECK(hipStreamSynchronize(stream));
 
     // Record this timing if this Transfer is being run in multistream mode
@@ -5534,7 +5563,7 @@ namespace {
                                   ExeInfo&             exeInfo)
   {
     auto cpuStart = std::chrono::high_resolution_clock::now();
-    ERR_CHECK(hipSetDevice(exeIndex));
+    ERR_CHECK(Simulation::SetLogicalDevice(exeIndex));
 
     int xccDim = exeInfo.useSubIndices ? exeInfo.numSubIndices : 1;
 
@@ -5566,6 +5595,9 @@ namespace {
                          xccDim, cfg, exeInfo.gfxKernelToUse,
                          exeInfo.subExecParamHostAccessible, exeInfo.resources[0]);
     }
+
+    if (Simulation::RocapCaptureMode())
+      return ERR_NONE;
 
     auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
 
@@ -5642,7 +5674,7 @@ namespace {
     auto cpuStart = std::chrono::high_resolution_clock::now();
 
     int numDsts = (int)resources.dstMem.size();
-    ERR_CHECK(hipSetDevice(exeIndex));
+    ERR_CHECK(Simulation::SetLogicalDevice(exeIndex));
     int subIterations = 0;
     size_t const initOffset = cfg.data.byteOffset / sizeof(float);
     float* const src = resources.srcMem[0] + initOffset;
@@ -5727,7 +5759,7 @@ namespace {
                                   ExeInfo&             exeInfo)
   {
     auto cpuStart = std::chrono::high_resolution_clock::now();
-    ERR_CHECK(hipSetDevice(exeIndex));
+    ERR_CHECK(Simulation::SetLogicalDevice(exeIndex));
 
     vector<std::future<ErrResult>> asyncTransfers;
     for (int i = 0; i < exeInfo.resources.size(); i++) {
@@ -5767,7 +5799,7 @@ namespace {
   {
     auto cpuStart = std::chrono::high_resolution_clock::now();
 
-    ERR_CHECK(hipSetDevice(exeIndex));
+    ERR_CHECK(Simulation::SetLogicalDevice(exeIndex));
 
     int subIterations = 0;
     if (cfg.general.useHipEvents)
@@ -5814,7 +5846,7 @@ namespace {
                                   ExeInfo&             exeInfo)
   {
     auto cpuStart = std::chrono::high_resolution_clock::now();
-    ERR_CHECK(hipSetDevice(exeIndex));
+    ERR_CHECK(Simulation::SetLogicalDevice(exeIndex));
 
     vector<std::future<ErrResult>> asyncTransfers;
     for (int i = 0; i < exeInfo.resources.size(); i++) {
@@ -5847,9 +5879,9 @@ namespace {
                                 uint32_t      ldsBytes,
                                 int           numSubIterations)
   {
-    int64_t startCycle;
-    bool const shouldRecordTiming = (threadIdx.x == 0);
-    if (shouldRecordTiming) startCycle = GetTimestamp();
+//    int64_t startCycle;
+//    bool const shouldRecordTiming = (threadIdx.x == 0);
+//    if (shouldRecordTiming) startCycle = GetTimestamp();
 
     extern __shared__ __align__(128) float shmem[];
 
@@ -5864,17 +5896,17 @@ namespace {
     int subIterations = 0;
     while (1) {
       tdm::tdmCopy(dst, src, sizeBytes, shmem, ldsBytes);
-      __syncthreads(); // Wait for all warps to finish
+//      __syncthreads(); // Wait for all warps to finish
       if (++subIterations == numSubIterations) break;
     }
 
-    if (shouldRecordTiming) {
-      __threadfence_system();
-      p.stopCycle  = GetTimestamp();
-      p.startCycle = startCycle;
-      GetHwId(p.hwId);
-      GetXccId(p.xccId);
-    }
+//    if (shouldRecordTiming) {
+//      __threadfence_system();
+//      p.stopCycle  = GetTimestamp();
+//      p.startCycle = startCycle;
+//      GetHwId(p.hwId);
+//      GetXccId(p.xccId);
+//    }
   }
 #else
   // gfx1250 tensor TDM builtins unavailable for this translation: emit empty kernel stubs with
@@ -5959,7 +5991,7 @@ namespace {
                                   ExeInfo&             exeInfo)
   {
     auto cpuStart = std::chrono::high_resolution_clock::now();
-    ERR_CHECK(hipSetDevice(exeIndex));
+    ERR_CHECK(Simulation::SetLogicalDevice(exeIndex));
 
     if (cfg.general.useMultiStream && exeInfo.streams.size() > 1 ) {
       // Launch one thread per Transfer in separate streams
@@ -6256,7 +6288,7 @@ namespace {
         for (int srcIdx = 0; srcIdx < resource->srcMem.size(); srcIdx++) {
           if (t.srcs[srcIdx].memRank == localRank) {
             if (IsGpuMemType(t.srcs[srcIdx].memType)) {
-              ERR_APPEND(hipSetDevice(t.srcs[srcIdx].memIndex), errResults);
+              ERR_APPEND(Simulation::SetLogicalDevice(t.srcs[srcIdx].memIndex), errResults);
             }
             if (verbose) {
               MemDevice const& md = t.srcs[srcIdx];
@@ -6269,7 +6301,8 @@ namespace {
             }
             ERR_APPEND(hipMemcpy(resource->srcMem[srcIdx] + initOffset, srcReference[srcIdx].data(), resource->numBytes,
                                  hipMemcpyDefault), errResults);
-            ERR_APPEND(hipDeviceSynchronize(), errResults);
+            if (!Simulation::RocapCaptureMode())
+              ERR_APPEND(hipDeviceSynchronize(), errResults);
           }
         }
       }
@@ -6343,19 +6376,30 @@ namespace {
       // Start CPU timing for this iteration
       auto cpuStart = std::chrono::high_resolution_clock::now();
 
-      // Execute all Transfers in parallel
-      std::vector<std::future<ErrResult>> asyncExecutors;
-      for (auto const& exeDevice : localExecutors) {
-        asyncExecutors.emplace_back(std::async(std::launch::async, RunExecutor,
-                                               iteration,
-                                               std::cref(cfg),
-                                               std::cref(exeDevice),
-                                               std::ref(executorMap[exeDevice])));
-      }
-
-      // Wait for all threads to finish
-      for (auto& asyncExecutor : asyncExecutors) {
-        ERR_APPEND(asyncExecutor.get(), errResults);
+      // Execute transfers. In FFM sim mode, run executors serially so roccap can
+      // record one kernel launch at a time (see TB_SERIAL_EXECUTORS / TB_PARALLEL_EXECUTORS).
+      if (Simulation::SerialExecutors()) {
+        for (auto const& exeDevice : localExecutors) {
+          if (Simulation::CaptureExecutorIndex() >= 0 && IsGpuExeType(exeDevice.exeType) &&
+              !Simulation::ShouldRunGpuExecutor(exeDevice.exeIndex))
+            continue;
+          ERR_APPEND(RunExecutor(iteration, cfg, exeDevice, executorMap[exeDevice]), errResults);
+        }
+      } else {
+        std::vector<std::future<ErrResult>> asyncExecutors;
+        for (auto const& exeDevice : localExecutors) {
+          if (Simulation::CaptureExecutorIndex() >= 0 && IsGpuExeType(exeDevice.exeType) &&
+              !Simulation::ShouldRunGpuExecutor(exeDevice.exeIndex))
+            continue;
+          asyncExecutors.emplace_back(std::async(std::launch::async, RunExecutor,
+                                                 iteration,
+                                                 std::cref(cfg),
+                                                 std::cref(exeDevice),
+                                                 std::ref(executorMap[exeDevice])));
+        }
+        for (auto& asyncExecutor : asyncExecutors) {
+          ERR_APPEND(asyncExecutor.get(), errResults);
+        }
       }
 
       // Wait for all ranks to finish
@@ -6365,7 +6409,7 @@ namespace {
       auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
       double deltaSec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() / cfg.general.numSubIterations;
 
-      if (cfg.data.alwaysValidate > 0) {
+      if (cfg.data.alwaysValidate > 0 && !Simulation::RocapCaptureMode()) {
         ERR_APPEND(ValidateAllTransfers(cfg, transfers, transferResources, dstReference, outputBuffer),
                    errResults);
       }
@@ -6423,7 +6467,7 @@ namespace {
             if (IsCpuMemType(t.dsts[dstIdx].memType) || cfg.data.validateDirect) {
               output = rss->dstMem[dstIdx] + initOffset;
             } else {
-              (void)hipSetDevice(t.dsts[dstIdx].memIndex);
+              (void)Simulation::SetLogicalDevice(t.dsts[dstIdx].memIndex);
               (void)hipMemcpy(outputBuffer.data(), rss->dstMem[dstIdx] + initOffset, t.numBytes, hipMemcpyDefault);
               (void)hipDeviceSynchronize();
               output = outputBuffer.data();
@@ -6997,6 +7041,14 @@ namespace {
       Log("[INFO] Running in single node mode\n");
     }
 
+    Simulation::Init();
+    if (verbose && Simulation::IsEnabled()) {
+      Log("[INFO] FFM simulation: %d logical GPU(s) on physical device %d (sim_gpu=%d)\n",
+          Simulation::GetNumLogicalGpus(),
+          Simulation::GetPhysicalDeviceId(),
+          Simulation::GetSimGpu());
+    }
+
     // Collect topology and distribute across all ranks
     CollectTopology();
     if (verbose) {
@@ -7037,6 +7089,7 @@ namespace {
 #elif defined(NVML_ENABLED)
     nvmlShutdown();
 #endif
+    Simulation::Shutdown();
   }
 
   namespace detail {
@@ -7671,6 +7724,9 @@ namespace {
     int numGpus = 0;
     hipError_t status = hipGetDeviceCount(&numGpus);
     if (status != hipSuccess) numGpus = 0;
+    if (Simulation::IsEnabled()) {
+      numGpus = Simulation::GetNumLogicalGpus();
+    }
     topo.numExecutors[EXE_GPU_GFX]  = numGpus;
     topo.numExecutors[EXE_GPU_DMA]  = numGpus;
     topo.numExecutors[EXE_GPU_BDMA] = numGpus;
@@ -7683,14 +7739,15 @@ namespace {
       int numXccs       = 0;
       int numDmaEngines = 0;
       int closestNuma   = -1;
+      int const physDev = Simulation::PhysicalDeviceForQuery(exeIndex);
 
-      if (hipDeviceGetAttribute(&numDeviceCUs, hipDeviceAttributeMultiprocessorCount, exeIndex) != hipSuccess) {
+      if (hipDeviceGetAttribute(&numDeviceCUs, hipDeviceAttributeMultiprocessorCount, physDev) != hipSuccess) {
         numDeviceCUs = 0;
       }
 
       std::string gpuName = "Unknown GPU";
       hipDeviceProp_t props;
-      if (hipGetDeviceProperties(&props, exeIndex) == hipSuccess) {
+      if (hipGetDeviceProperties(&props, physDev) == hipSuccess) {
         gpuName = props.name;
         std::string fullName = props.gcnArchName;
         gpuArchNames[exeIndex] = fullName.substr(0, fullName.find(':'));
@@ -7701,7 +7758,8 @@ namespace {
       topo.executorName[{EXE_GPU_TDM,  exeIndex}] = gpuName;
 
 #if !defined(__NVCC__)
-      hsa_agent_t gpuAgent = gpuAgents[exeIndex];
+      hsa_agent_t gpuAgent = (!gpuAgents.empty() && Simulation::IsEnabled())
+                             ? gpuAgents[0] : gpuAgents[exeIndex];
       if (hsa_agent_get_info(gpuAgent, (hsa_agent_info_t)HSA_AMD_AGENT_INFO_NUM_XCC, &numXccs) != HSA_STATUS_SUCCESS)
         numXccs = 1;
 
@@ -7775,7 +7833,8 @@ namespace {
     std::vector<std::string> gpuAddressList;
     for (int gpuIdx = 0; gpuIdx < numGpus; gpuIdx++) {
       char hipPciBusId[64];
-      hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), gpuIdx);
+      int const physDev = Simulation::PhysicalDeviceForQuery(gpuIdx);
+      hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), physDev);
       gpuAddressList.push_back(err == hipSuccess ? std::string(hipPciBusId) : "");
       if (err != hipSuccess)
         Log("Failed to get PCI Bus ID for HIP device %d: %s\n", gpuIdx, hipGetErrorString(err));
@@ -8144,7 +8203,9 @@ namespace {
   ErrResult System::GetHsaAgent(ExeDevice const& exeDevice, hsa_agent_t& agent) const
   {
     int numCpus = static_cast<int>(cpuAgents.size());
-    int numGpus = static_cast<int>(gpuAgents.size());
+    int numGpus = Simulation::IsEnabled()
+                  ? Simulation::GetNumLogicalGpus()
+                  : static_cast<int>(gpuAgents.size());
     int exeIndex = exeDevice.exeIndex;
 
     switch (exeDevice.exeType) {
@@ -8156,7 +8217,9 @@ namespace {
     case EXE_GPU_GFX: case EXE_GPU_DMA: case EXE_GPU_BDMA: case EXE_GPU_TDM:
       if (exeIndex < 0 || exeIndex >= numGpus)
         return {ERR_FATAL, "GPU index must be between 0 and %d inclusively", numGpus - 1};
-      agent = gpuAgents[exeIndex];
+      if (gpuAgents.empty())
+        return {ERR_FATAL, "No GPU agents available"};
+      agent = gpuAgents[Simulation::IsEnabled() ? 0 : exeIndex];
       break;
     default:
       return {ERR_FATAL,

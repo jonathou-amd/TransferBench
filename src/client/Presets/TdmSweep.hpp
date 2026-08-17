@@ -21,6 +21,7 @@ THE SOFTWARE.
 */
 
 #include "EnvVars.hpp"
+#include "Simulation.hpp"
 
 // TdmSweepPreset - sweeps every knob that affects Tensor-Data-Mover (TDM) copy
 // performance for a given TDM Transfer and reports the best-performing
@@ -48,9 +49,10 @@ int TdmSweepPreset(EnvVars&          ev,
 
   // Verify the hardware can actually run TDM copies before sweeping anything.
   int const numTdmGpus = TransferBench::GetNumExecutors(EXE_GPU_TDM);
-  if (numTdmGpus <= 0 || !tdm::IsTdmCopySupported(0)) {
+  if (numTdmGpus <= 0 ||
+      !tdm::IsTdmCopySupported(Simulation::PhysicalDeviceForQuery(0))) {
     Utils::Print("[WARN] TDM executor is not supported on this device "
-                 "(requires TDM-capable hardware: gfx1250 or NVIDIA sm_90+). Terminating tdmsweep.\n");
+                 "(requires TDM-capable hardware: gfx1250, gfx1260, or NVIDIA sm_90+). Terminating tdmsweep.\n");
     return ERR_FATAL;
   }
 

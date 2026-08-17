@@ -21,9 +21,12 @@ THE SOFTWARE.
 */
 
 #include "Presets.hpp"
+#include "Simulation.hpp"
 #include "Topology.hpp"
 #include <algorithm>
+#include <cstring>
 #include <fstream>
+#include <unistd.h>
 
 void DisplayVersion();
 void DisplayUsage(char const* cmdName);
@@ -32,6 +35,22 @@ using namespace TransferBench;
 using namespace TransferBench::Utils;
 
 size_t constexpr DEFAULT_BYTES_PER_TRANSFER = (1<<28);
+
+static bool FastExitAfterRocapCapture()
+{
+  const char* val = getenv("TB_ROCCAP_FAST_EXIT");
+  return val && val[0] && strcmp(val, "0") != 0;
+}
+
+static void ExitAfterRocapCapture(int retCode)
+{
+  // Normal process exit lets roccap run hsa_shut_down finalize (writes roc_capture.json).
+  // _exit() skips that and produces truncated .cap files on FFM.
+  if (!FastExitAfterRocapCapture()) return;
+  fflush(stdout);
+  fflush(stderr);
+  _exit(retCode);
+}
 
 int main(int argc, char **argv)
 {
@@ -71,7 +90,10 @@ int main(int argc, char **argv)
 
   // Run preset benchmark if requested
   int retCode = 0;
-  if (RunPreset(ev, numBytesPerTransfer, argc, argv, retCode)) return retCode;
+  if (RunPreset(ev, numBytesPerTransfer, argc, argv, retCode)) {
+    ExitAfterRocapCapture(retCode);
+    return retCode;
+  }
 
   // Read input from command line or configuration file
   bool isDryRun = !strcmp(argv[1], "dryrun");
@@ -221,6 +243,8 @@ int main(int argc, char **argv)
       if (numBytesPerTransfer != 0 || !hasUnspecified) break;
     }
   }
+
+  ExitAfterRocapCapture(0);
 }
 
 void DisplayVersion()

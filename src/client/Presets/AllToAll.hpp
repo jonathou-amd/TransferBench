@@ -151,9 +151,11 @@ int AllToAllPreset(EnvVars&          ev,
           if (!a2aLocal) continue;
         } else if (a2aDirect) {
 #if !defined(__NVCC__)
-          uint32_t linkType, hopCount;
-          HIP_CALL(hipExtGetLinkTypeAndHopCount(i, j, &linkType, &hopCount));
-          if (hopCount != 1) continue;
+          if (!TransferBench::IsSimulationEnabled()) {
+            uint32_t linkType, hopCount;
+            HIP_CALL(hipExtGetLinkTypeAndHopCount(i, j, &linkType, &hopCount));
+            if (hopCount != 1) continue;
+          }
 #endif
         }
 
