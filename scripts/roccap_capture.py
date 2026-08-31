@@ -18,10 +18,12 @@ Run inside the FFM singularity container (competes-arcadia-260806.sif):
 Uses the container's bundled roccap (4.10 via /workspace/rocplaycap-Linux).
 
 Produces one .cap and matching heap_bases JSON per logical GPU (Iris-style pairing):
-  transferbench_GBS_768_UNROLL_4_NSE_8_TEMP_3_A2A_32M_2nproc_rank0.cap
-  transferbench_GBS_768_UNROLL_4_NSE_8_TEMP_3_A2A_32M_2nproc_rank0_heap_bases.json
-  transferbench_tdm_GBS_256_NSE_64_A2A_32M_2nproc_rank0.cap
-  transferbench_tdm_GBS_256_NSE_64_A2A_32M_2nproc_rank0_heap_bases.json
+  transferbench_ffm_write_GBS_768_UNROLL_4_NSE_8_TEMP_3_A2A_32M_2nproc_rank0.cap
+  transferbench_ffm_read_GBS_768_UNROLL_4_NSE_8_TEMP_3_A2A_32M_2nproc_rank0.cap
+  transferbench_ffm_tdm_write_LDS_64K_GBS_256_NSE_64_A2A_32M_2nproc_rank0.cap
+  transferbench_ffm_tdm_read_LDS_64K_GBS_256_NSE_64_A2A_32M_2nproc_rank0.cap
+
+Basename prefix is transferbench_ffm; read/write from USE_REMOTE_READ (default write).
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -41,14 +44,64 @@ REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_TB_BINARY = "TransferBench"
 DEFAULT_DISP_GFX = "(GpuCopyKernel|GpuReduceKernel)/0-"
 DEFAULT_HEAP_PREFIX = "a2a"  # legacy manual runs only; wrapper sets TB_HEAP_BASES_FILE
+CAP_NAME_PREFIX = "transferbench_ffm"
 
 # FFM singularity image layout (see /workspace/rocplaycap-Linux in container)
 ROCCAP_BUNDLE = Path("/workspace/rocplaycap-Linux/opt/rocm")
 
 
+def access_mode_tag(args: argparse.Namespace) -> str:
+    """read = USE_REMOTE_READ=1 (remote read / local write); write = default."""
+    remote_read = 0 if args.use_remote_read is None else args.use_remote_read
+    return "read" if remote_read else "write"
+
+
+def parse_size_bytes(raw: str) -> int:
+    """Parse TransferBench-style sizes: 65536, 64K, 256M (K/M/G multiply by 1024)."""
+    text = raw.strip()
+    if not text:
+        return 0
+    unit = text[-1].upper()
+    if unit in ("K", "M", "G"):
+        try:
+            val = int(text[:-1])
+        except ValueError:
+            sys.exit(f"Invalid size (expected integer or K/M/G suffix): {raw!r}")
+    else:
+        try:
+            return int(text)
+        except ValueError:
+            sys.exit(f"Invalid size (expected integer or K/M/G suffix): {raw!r}")
+    if unit == "G":
+        val *= 1024
+    if unit in ("G", "M"):
+        val *= 1024
+    if unit in ("G", "M", "K"):
+        val *= 1024
+    return val
+
+
+def format_lds_basename_tag(raw: str, bytes_val: int) -> str:
+    """Build LDS tag for cap basename, e.g. LDS_64K or LDS_MAX."""
+    if bytes_val == 0:
+        return "LDS_MAX"
+    suffix = raw.strip().upper().rstrip("B")
+    if suffix and suffix[-1] in "KMG":
+        return f"LDS_{suffix}"
+    for unit, scale in (("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)):
+        if bytes_val >= scale and bytes_val % scale == 0:
+            return f"LDS_{bytes_val // scale}{unit}"
+    return f"LDS_{bytes_val}"
+
+
 def build_capture_basename(args: argparse.Namespace) -> str:
+    access = access_mode_tag(args)
     if args.use_tdm_exec:
-        parts = ["transferbench_tdm"]
+        parts = [f"{CAP_NAME_PREFIX}_tdm_{access}"]
+        if args.tdm_lds_bytes is not None:
+            lds_raw = args.tdm_lds_bytes
+            lds_val = parse_size_bytes(lds_raw)
+            parts.append(format_lds_basename_tag(lds_raw, lds_val))
         if args.gfx_block_size is not None:
             parts.append(f"GBS_{args.gfx_block_size}")
         if args.num_sub_exec is not None:
@@ -56,7 +109,7 @@ def build_capture_basename(args: argparse.Namespace) -> str:
         parts.append(f"{args.preset.upper()}_{args.transfer_size}")
         return "_".join(parts)
 
-    parts = ["transferbench"]
+    parts = [f"{CAP_NAME_PREFIX}_{access}"]
     if args.gfx_block_size is not None:
         parts.append(f"GBS_{args.gfx_block_size}")
     if args.gfx_unroll is not None:
@@ -144,6 +197,8 @@ def apply_env(args: argparse.Namespace, heap_prefix: str) -> dict[str, str]:
         env["USE_DMA_EXEC"] = "1"
     if args.use_tdm_exec:
         env["USE_TDM_EXEC"] = "1"
+    if args.tdm_lds_bytes is not None:
+        env["TDM_LDS_BYTES"] = str(parse_size_bytes(args.tdm_lds_bytes))
     if args.use_remote_read is not None:
         env["USE_REMOTE_READ"] = str(args.use_remote_read)
 
@@ -227,13 +282,18 @@ def validate_cap_file(cap_path: Path) -> tuple[bool, str]:
         return False, "capture file is missing or empty"
 
     roccap_path = find_roccap()
+    cap_path = cap_path.resolve()
+    # roccap extract --meta writes roc_capture*.json into cwd; many prior captures in
+    # the repo root trigger "Maximum number of filenames reached" even when the .cap is fine.
+    validate_cwd = cap_path.parent
     try:
         completed = subprocess.run(
-            [roccap_path, "extract", "--meta", str(cap_path)],
+            [roccap_path, "extract", "--meta", cap_path.name],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             check=False,
+            cwd=str(validate_cwd),
         )
     except OSError as exc:
         return False, f"roccap extract --meta failed to launch: {exc}"
@@ -244,6 +304,23 @@ def validate_cap_file(cap_path: Path) -> tuple[bool, str]:
     output = (completed.stdout or "").strip()
     if "Cannot locate metadata stream" in output:
         return False, "tar archive is truncated (metadata stream missing; roccap likely crashed during finalize)"
+    if "Maximum number of filenames reached" in output:
+        # Fallback: run from an empty temp dir (repo root may have many roc_capture_*.json).
+        with tempfile.TemporaryDirectory(prefix="roccap_validate_") as tmp:
+            try:
+                retry = subprocess.run(
+                    [roccap_path, "extract", "--meta", str(cap_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    cwd=tmp,
+                )
+            except OSError as exc:
+                return False, f"roccap extract --meta failed to launch: {exc}"
+            if retry.returncode == 0:
+                return True, "roccap extract --meta succeeded (validated in temp dir)"
+            output = (retry.stdout or "").strip() or output
     if output:
         return False, output.splitlines()[-1]
     return False, f"roccap extract --meta failed with exit code {completed.returncode}"
@@ -342,10 +419,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     bench.add_argument("--num-sub-exec", type=int, default=None)
     bench.add_argument("--gfx-temporal", type=int, default=None)
     bench.add_argument("--a2a-direct", type=int, default=1, choices=[0, 1])
-    bench.add_argument("--use-remote-read", type=int, default=None, choices=[0, 1])
+    bench.add_argument(
+        "--use-remote-read",
+        type=int,
+        default=None,
+        choices=[0, 1],
+        help="0=write (local read, remote write; default), 1=read (remote read, local write). "
+        "Affects USE_REMOTE_READ and cap basename (transferbench_ffm_write_* vs transferbench_ffm_read_*).",
+    )
     bench.add_argument("--tb-verbose", action="store_true")
     bench.add_argument("--use-dma-exec", action="store_true")
     bench.add_argument("--use-tdm-exec", action="store_true")
+    bench.add_argument(
+        "--tdm-lds-bytes",
+        default=None,
+        metavar="SIZE",
+        help="TDM LDS staging bytes per threadblock (e.g. 64K, 65536, 0=device max). "
+        "Sets TDM_LDS_BYTES and adds LDS_<SIZE> to TDM cap basenames.",
+    )
 
     roccap = parser.add_argument_group("roccap")
     roccap.add_argument("-k", "--kernel-regex", default="")
@@ -418,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  cap file:   {cap_path}")
         print(f"  heap json:  {heap_bases_path}")
         print("  env:")
-        for key in sorted(k for k in run_env if k.startswith(("TB_", "NUM_", "GFX_", "A2A_", "USE_", "ALWAYS_"))):
+        for key in sorted(k for k in run_env if k.startswith(("TB_", "NUM_", "GFX_", "TDM_", "A2A_", "USE_", "ALWAYS_"))):
             print(f"    {key}={run_env[key]}")
 
         if args.skip_roccap:

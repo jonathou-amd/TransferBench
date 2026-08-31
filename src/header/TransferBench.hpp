@@ -5427,7 +5427,7 @@ namespace {
   }
 
   // Must match mapping in GetGpuKernelUnrollIdx
-  constexpr int KERN_UNROLLS = 10;
+  constexpr int KERN_UNROLLS = 11;
 #define GPU_KERNEL_UNROLL_DECL(LAUNCH_BOUND) \
   {GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  1),  \
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  2),  \
@@ -5438,13 +5438,15 @@ namespace {
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  7),  \
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  8),  \
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 16),  \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 32)}
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 32),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 64)}
 
   // Must match the unroll mapping in GPU_KERNEL_UNROLL_DECL
   int GetGpuKernelUnrollIdx(int unroll) {
     if (1 <= unroll && unroll <= 8) return unroll - 1;
     if (unroll == 16)               return 8;
     if (unroll == 32)               return 9;
+    if (unroll == 64)               return 10;
     return -1;
   }
 
