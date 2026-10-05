@@ -22,8 +22,15 @@ Produces one .cap and matching heap_bases JSON per logical GPU (Iris-style pairi
   transferbench_ffm_read_GBS_768_UNROLL_4_NSE_8_TEMP_3_A2A_32M_2nproc_rank0.cap
   transferbench_ffm_tdm_write_LDS_64K_GBS_256_NSE_64_A2A_32M_2nproc_rank0.cap
   transferbench_ffm_tdm_read_LDS_64K_GBS_256_NSE_64_A2A_32M_2nproc_rank0.cap
+  transferbench_ffm_async_write_GBS_256_NSE_80_A2A_256M_2nproc_rank0.cap
+  transferbench_ffm_async_read_GBS_256_NSE_80_A2A_256M_2nproc_rank0.cap
+  transferbench_ffm_dma_write_GMQ_8_NSE_7_A2A_36M_8nproc_rank0.cap
+  transferbench_ffm_dma_read_GMQ_8_NSE_7_A2A_36M_8nproc_rank0.cap
 
 Basename prefix is transferbench_ffm; read/write from USE_REMOTE_READ (default write).
+Modes: default=GMEM/GFX, --use-tdm-exec=tensor TDM, --use-async-exec=async-to/from-LDS,
+--use-dma-exec=SDMA (default --disp 0-).
+DMA uses SDMA (hipMemcpyDeviceToDeviceNoCU), not GFX kernels; default --disp is 0-.
 """
 
 from __future__ import annotations
@@ -94,18 +101,77 @@ def format_lds_basename_tag(raw: str, bytes_val: int) -> str:
     return f"LDS_{bytes_val}"
 
 
+def parse_gfx_scope(value: str) -> int:
+    """Parse GFX_SCOPE: -1/unset, 0..3, or wgp|se|dev|sys."""
+    raw = value.strip().lower()
+    aliases = {
+        "-1": -1,
+        "unset": -1,
+        "default": -1,
+        "0": 0,
+        "wgp": 0,
+        "cu": 0,
+        "wavefront": 0,
+        "1": 1,
+        "se": 1,
+        "workgroup": 1,
+        "2": 2,
+        "dev": 2,
+        "device": 2,
+        "agent": 2,
+        "3": 3,
+        "sys": 3,
+        "system": 3,
+    }
+    if raw not in aliases:
+        raise argparse.ArgumentTypeError(
+            f"invalid --gfx-scope {value!r}; use -1/unset or 0..3 / wgp|se|dev|sys"
+        )
+    return aliases[raw]
+
+
+def scope_basename_tag(scope: int) -> str:
+    return {0: "WGP", 1: "SE", 2: "DEV", 3: "SYS"}.get(scope, str(scope))
+
+
+def default_gpu_max_hw_queues(args: argparse.Namespace) -> int:
+    """A2A_DIRECT needs one stream per peer GPU (N-1 parallel SDMA transfers)."""
+    return max(1, args.num_gpu_devices - 1)
+
+
 def build_capture_basename(args: argparse.Namespace) -> str:
     access = access_mode_tag(args)
-    if args.use_tdm_exec:
-        parts = [f"{CAP_NAME_PREFIX}_tdm_{access}"]
+    if args.use_dma_exec:
+        parts = [f"{CAP_NAME_PREFIX}_dma_{access}"]
+        gmq = args.gpu_max_hw_queues
+        if gmq is None:
+            gmq = default_gpu_max_hw_queues(args)
+        parts.append(f"GMQ_{gmq}")
+        if args.num_sub_exec is not None:
+            parts.append(f"NSE_{args.num_sub_exec}")
+        parts.append(f"{args.preset.upper()}_{args.transfer_size}")
+        return "_".join(parts)
+
+    # Async and tensor-TDM share GpuTdmKernel / LDS staging; distinguish in basename.
+    if args.use_async_exec or args.use_tdm_exec:
+        mode = "async" if args.use_async_exec else "tdm"
+        parts = [f"{CAP_NAME_PREFIX}_{mode}_{access}"]
         if args.tdm_lds_bytes is not None:
             lds_raw = args.tdm_lds_bytes
             lds_val = parse_size_bytes(lds_raw)
             parts.append(format_lds_basename_tag(lds_raw, lds_val))
         if args.gfx_block_size is not None:
             parts.append(f"GBS_{args.gfx_block_size}")
+        # Async hot-loop unroll / temporal reuse --gfx-unroll / --gfx-temporal (same as VMEM).
+        if args.use_async_exec:
+            unroll = 2 if args.gfx_unroll is None else args.gfx_unroll
+            parts.append(f"UNROLL_{unroll}")
         if args.num_sub_exec is not None:
             parts.append(f"NSE_{args.num_sub_exec}")
+        if args.use_async_exec and args.gfx_temporal is not None:
+            parts.append(f"TEMP_{args.gfx_temporal}")
+        if args.gfx_scope is not None and args.gfx_scope >= 0:
+            parts.append(f"SCOPE_{scope_basename_tag(args.gfx_scope)}")
         parts.append(f"{args.preset.upper()}_{args.transfer_size}")
         return "_".join(parts)
 
@@ -118,6 +184,8 @@ def build_capture_basename(args: argparse.Namespace) -> str:
         parts.append(f"NSE_{args.num_sub_exec}")
     if args.gfx_temporal is not None:
         parts.append(f"TEMP_{args.gfx_temporal}")
+    if args.gfx_scope is not None and args.gfx_scope >= 0:
+        parts.append(f"SCOPE_{scope_basename_tag(args.gfx_scope)}")
     parts.append(f"{args.preset.upper()}_{args.transfer_size}")
     return "_".join(parts)
 
@@ -134,7 +202,7 @@ def build_disp_filter(args: argparse.Namespace) -> str:
         return f"{args.kernel_regex}/0-"
     if args.use_dma_exec:
         return "0-"
-    if args.use_tdm_exec:
+    if args.use_async_exec or args.use_tdm_exec:
         return "GpuTdmKernel/0-"
     return DEFAULT_DISP_GFX
 
@@ -177,16 +245,21 @@ def apply_env(args: argparse.Namespace, heap_prefix: str) -> dict[str, str]:
     if args.num_warmups is not None:
         env["NUM_WARMUPS"] = str(args.num_warmups)
     if args.gfx_block_size is not None:
-        if args.use_tdm_exec:
+        if args.use_async_exec or args.use_tdm_exec:
             env["TDM_BLOCK_SIZE"] = str(args.gfx_block_size)
         else:
             env["GFX_BLOCK_SIZE"] = str(args.gfx_block_size)
     if args.gfx_unroll is not None:
         env["GFX_UNROLL"] = str(args.gfx_unroll)
+    elif args.use_async_exec:
+        # a2a defaults GFX_UNROLL=2; set explicitly so async hot-loop unroll is deterministic.
+        env["GFX_UNROLL"] = "2"
     if args.num_sub_exec is not None:
         env["NUM_SUB_EXEC"] = str(args.num_sub_exec)
     if args.gfx_temporal is not None:
         env["GFX_TEMPORAL"] = str(args.gfx_temporal)
+    if args.gfx_scope is not None:
+        env["GFX_SCOPE"] = str(args.gfx_scope)
     if args.a2a_direct is not None:
         env["A2A_DIRECT"] = str(args.a2a_direct)
     if args.tb_verbose:
@@ -195,6 +268,17 @@ def apply_env(args: argparse.Namespace, heap_prefix: str) -> dict[str, str]:
         env.pop("TB_VERBOSE", None)
     if args.use_dma_exec:
         env["USE_DMA_EXEC"] = "1"
+        # FFM container often sets HSA_ENABLE_SDMA=0; without SDMA, DMA falls back to GFX blit kernels.
+        env["HSA_ENABLE_SDMA"] = "1"
+        gmq = args.gpu_max_hw_queues
+        if gmq is None:
+            gmq = default_gpu_max_hw_queues(args)
+        env["GPU_MAX_HW_QUEUES"] = str(gmq)
+    if args.use_hsa_dma:
+        env["USE_HSA_DMA"] = "1"
+    if args.use_async_exec:
+        env["USE_ASYNC_EXEC"] = "1"
+        env["USE_ASYNC_COPY"] = "1"
     if args.use_tdm_exec:
         env["USE_TDM_EXEC"] = "1"
     if args.tdm_lds_bytes is not None:
@@ -367,10 +451,11 @@ def run_command(argv: list[str], env: dict[str, str], cwd: Path, cap_path: Path 
     print(f"[ERROR] Command failed: {describe_exit(rc)}", file=sys.stderr)
     if cap_path is not None and cap_path.is_file() and cap_path.stat().st_size == 0:
         print(
-            "[HINT] Capture file is empty. The --disp filter may not match the kernel TransferBench "
+            "[HINT] Capture file is empty. The --disp filter may not match what TransferBench "
             "launched. For GFX a2a with GFX_UNROLL>2, try:\n"
             "  --disp 'GpuReduceKernel/0-'\n"
-            "  --disp '(GpuCopyKernel|GpuReduceKernel)/0-'",
+            "  --disp '(GpuCopyKernel|GpuReduceKernel)/0-'\n"
+            "For SDMA (--use-dma-exec), default --disp is '0-' (no GFX kernel dispatch).",
             file=sys.stderr,
         )
     if rc == -signal.SIGSEGV:
@@ -415,9 +500,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     bench.add_argument("--num-iterations", type=int, default=1)
     bench.add_argument("--num-warmups", type=int, default=0)
     bench.add_argument("--gfx-block-size", type=int, default=None)
-    bench.add_argument("--gfx-unroll", type=int, default=None)
+    bench.add_argument(
+        "--gfx-unroll",
+        type=int,
+        default=None,
+        help="GFX_UNROLL for VMEM kernels, and async hot-loop unroll for --use-async-exec "
+        "(legal: 1-8,16,32,48,56,64; async default 2).",
+    )
     bench.add_argument("--num-sub-exec", type=int, default=None)
-    bench.add_argument("--gfx-temporal", type=int, default=None)
+    bench.add_argument(
+        "--gfx-temporal",
+        type=int,
+        default=None,
+        help="GFX_TEMPORAL for VMEM kernels, and async load/store NT hints for --use-async-exec "
+        "(0=none/RT, 1=NT load, 2=NT store, 3=both NT).",
+    )
+    bench.add_argument(
+        "--gfx-scope",
+        type=parse_gfx_scope,
+        default=None,
+        help="GFX_SCOPE for VMEM and async (0/wgp, 1/se, 2/dev, 3/sys). "
+        "VMEM: unset keeps legacy loads/stores; set uses scoped global ops (dwordx4 via "
+        "amdgcn builtins). Async: unset defaults to SYS.",
+    )
     bench.add_argument("--a2a-direct", type=int, default=1, choices=[0, 1])
     bench.add_argument(
         "--use-remote-read",
@@ -428,14 +533,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Affects USE_REMOTE_READ and cap basename (transferbench_ffm_write_* vs transferbench_ffm_read_*).",
     )
     bench.add_argument("--tb-verbose", action="store_true")
-    bench.add_argument("--use-dma-exec", action="store_true")
-    bench.add_argument("--use-tdm-exec", action="store_true")
+    bench.add_argument(
+        "--use-dma-exec",
+        action="store_true",
+        help="Use GPU SDMA executor (USE_DMA_EXEC=1). Caps SDMA traffic via --disp 0- (no GFX kernel).",
+    )
+    bench.add_argument(
+        "--gpu-max-hw-queues",
+        type=int,
+        default=None,
+        metavar="N",
+        help="GPU_MAX_HW_QUEUES for DMA/BMA parallelism. Default with --use-dma-exec: NUM_GPU_DEVICES-1.",
+    )
+    bench.add_argument(
+        "--use-hsa-dma",
+        action="store_true",
+        help="Use hsa_amd_memory_async_copy instead of hipMemcpyAsync (USE_HSA_DMA=1).",
+    )
+    bench.add_argument(
+        "--use-tdm-exec",
+        action="store_true",
+        help="Use tensor-TDM executor (USE_TDM_EXEC=1) via GpuTdmKernel + tdm::tdmCopy.",
+    )
+    bench.add_argument(
+        "--use-async-exec",
+        action="store_true",
+        help="Use async-to/from-LDS copy backend (USE_ASYNC_EXEC=1) via same GpuTdmKernel + async::tdmCopy. "
+        "Mutually exclusive with --use-tdm-exec / --use-dma-exec.",
+    )
     bench.add_argument(
         "--tdm-lds-bytes",
         default=None,
         metavar="SIZE",
-        help="TDM LDS staging bytes per threadblock (e.g. 64K, 65536, 0=device max). "
-        "Sets TDM_LDS_BYTES and adds LDS_<SIZE> to TDM cap basenames.",
+        help="TDM/async LDS staging bytes per threadblock (e.g. 64K, 65536, 0=device max). "
+        "Sets TDM_LDS_BYTES and adds LDS_<SIZE> to TDM/async cap basenames.",
     )
 
     roccap = parser.add_argument_group("roccap")
@@ -466,8 +597,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    if args.use_dma_exec and args.use_tdm_exec:
-        print("[WARN] Both --use-dma-exec and --use-tdm-exec set; using DMA", file=sys.stderr)
+    if args.use_dma_exec and (args.use_tdm_exec or args.use_async_exec):
+        print("[WARN] Both --use-dma-exec and TDM/async set; using DMA", file=sys.stderr)
+        args.use_tdm_exec = False
+        args.use_async_exec = False
+    elif args.use_async_exec and args.use_tdm_exec:
+        print("[WARN] Both --use-async-exec and --use-tdm-exec set; using async", file=sys.stderr)
         args.use_tdm_exec = False
 
     setup_ffm_paths()

@@ -100,6 +100,7 @@ public:
   int gfxSeType;                     // GFX subexecutor type (0=threadblock, 1=warp)
   int gfxSingleTeam;                 // Team all subExecutors across the data array
   int gfxTemporal;                   // Non-temporal load/store mode (0=none, 1=load, 2=store, 3=both)
+  int gfxScope;                      // Mem scope (-1=unset, 0=WGP, 1=SE, 2=DEV, 3=SYS)
   int gfxUnroll;                     // GFX-kernel unroll factor
   int gfxWaveOrder;                  // GFX-kernel wavefront ordering
   int gfxWordSize;                   // GFX-kernel packed data size (4=DWORDx4, 2=DWORDx2, 1=DWORDx1)
@@ -130,6 +131,7 @@ public:
   int tdmBlockOrder;                 // How threadblocks for multiple Transfers are ordered 0=sequential 1=interleaved
   int tdmBlockSize;                  // Size of each threadblock for TDM kernels (must be multiple of 32)
   int tdmLdsBytes;                   // Size of LDS (shared memory) bytes per threadblock for TDM kernels (0 = use device max)
+  int tdmUseAsyncCopy;               // 0=tensor TDM; 1=async-to/from-LDS copy backend inside GpuTdmKernel
 
   // Developer features
   int gpuMaxHwQueues;                // Tracks GPU_MAX_HW_QUEUES environment variable
@@ -166,6 +168,7 @@ public:
     gfxSeType         = GetEnvVar("GFX_SE_TYPE"         , 0);
     gfxSingleTeam     = GetEnvVar("GFX_SINGLE_TEAM"     , 0);
     gfxTemporal       = GetEnvVar("GFX_TEMPORAL"        , 0);
+    gfxScope          = GetEnvVar("GFX_SCOPE"           ,-1);
     gfxUnroll         = GetEnvVar("GFX_UNROLL"          , defaultGfxUnroll);
     gfxWaveOrder      = GetEnvVar("GFX_WAVE_ORDER"      , 0);
     gfxWordSize       = GetEnvVar("GFX_WORD_SIZE"       , 4);
@@ -185,6 +188,7 @@ public:
     tdmBlockOrder     = GetEnvVar("TDM_BLOCK_ORDER"     , 0);
     tdmBlockSize      = GetEnvVar("TDM_BLOCK_SIZE"      , 256);
     tdmLdsBytes       = GetEnvVar("TDM_LDS_BYTES"       , 0);
+    tdmUseAsyncCopy   = GetEnvVar("USE_ASYNC_COPY"      , 0);
     useHipEvents      = GetEnvVar("USE_HIP_EVENTS"      , 1);
     useHsaDma         = GetEnvVar("USE_HSA_DMA"         , 0);
     useInteractive    = GetEnvVar("USE_INTERACTIVE"     , 0);
@@ -375,6 +379,9 @@ public:
     printf(" GFX_KERNEL          - -1=auto, 0=force GpuReduceKernel, 1=force GpuCopyKernel (may error if ineligible)\n");
     printf(" GFX_SE_TYPE         - SubExecutor granularity type (0=threadblock, 1=warp)\n");
     printf(" GFX_TEMPORAL        - Use of non-temporal loads or stores (0=none 1=loads 2=stores 3=both)\n");
+    printf(" GFX_SCOPE           - Memory scope for VMEM/async (-1=unset, 0=WGP, 1=SE, 2=DEV, 3=SYS).\n");
+    printf("                       VMEM: unset keeps legacy loads/stores; set uses scoped global ops.\n");
+    printf("                       Async: unset defaults to SYS (prior behavior); set overrides scope.\n");
     printf(" GFX_UNROLL          - Unroll factor for GFX kernel\n");
     printf(" GFX_SINGLE_TEAM     - Have subexecutors work together on full array instead of working on disjoint subarrays\n");
     printf(" GFX_WAVE_ORDER      - Stride pattern for GFX kernel (0=UWC,1=UCW,2=WUC,3=WCU,4=CUW,5=CWU)\n");
@@ -407,6 +414,7 @@ public:
     printf(" TDM_BLOCK_ORDER     - How blocks for TDM transfers are ordered. 0=sequential, 1=interleaved\n");
     printf(" TDM_BLOCK_SIZE      - # of threads per threadblock for TDM (async tensor) kernels (Must be multiple of 32)\n");
     printf(" TDM_LDS_BYTES       - Amount of LDS bytes to allocate per workgroup for TDM kernels (0 = device max; K/M/G suffixes accepted)\n");
+    printf(" USE_ASYNC_COPY      - Use async-to/from-LDS backend inside GpuTdmKernel (1) instead of tensor TDM (0)\n");
     printf(" USE_HIP_EVENTS      - Use HIP events for GFX executor timing\n");
     printf(" USE_HIP_EVENTS      - Use HIP events for GFX/DMA/TDM executor timing (0=CPU wall-clock)\n");
     printf(" USE_HSA_DMA         - Use hsa_amd_async_copy instead of hipMemcpy for non-targeted DMA execution\n");
@@ -498,6 +506,12 @@ public:
                  gfxTemporal == 1 ? "Using non-temporal loads" :
                  gfxTemporal == 2 ? "Using non-temporal stores" :
                                     "Using non-temporal loads and stores"));
+    Print("GFX_SCOPE", gfxScope,
+          "%s", (gfxScope < 0 ? "Unset (VMEM legacy; async defaults to SYS)" :
+                 gfxScope == 0 ? "WGP (wavefront/CU)" :
+                 gfxScope == 1 ? "SE (shader engine / workgroup)" :
+                 gfxScope == 2 ? "DEV (agent/device)" :
+                                 "SYS (system)"));
 
     Print("GFX_UNROLL", gfxUnroll,
           "Using GFX unroll factor of %d", gfxUnroll);
@@ -557,6 +571,8 @@ public:
     Print("TDM_LDS_BYTES", tdmLdsBytes, "%s",
           tdmLdsBytes == 0 ? "Using device max LDS bytes per workgroup"
           : (std::string("Setting LDS to ") + std::to_string(tdmLdsBytes) + " bytes per workgroup").c_str());
+    Print("USE_ASYNC_COPY", tdmUseAsyncCopy,
+          "Using %s LDS-staged copy backend", tdmUseAsyncCopy ? "async-to/from-LDS" : "tensor TDM");
     Print("USE_HIP_EVENTS", useHipEvents,
           "Using %s for GFX/DMA/TDM Executor timing", useHipEvents ? "HIP events" : "CPU wall time");
     Print("USE_HSA_DMA", useHsaDma,
@@ -750,6 +766,7 @@ public:
     cfg.gfx.seType                 = gfxSeType;
     cfg.gfx.unrollFactor           = gfxUnroll;
     cfg.gfx.temporalMode           = gfxTemporal;
+    cfg.gfx.memScope               = gfxScope;
     cfg.gfx.useSingleTeam          = gfxSingleTeam;
     cfg.gfx.waveOrder              = gfxWaveOrder;
     cfg.gfx.wordSize               = gfxWordSize;
@@ -767,6 +784,7 @@ public:
     cfg.tdm.blockOrder             = tdmBlockOrder;
     cfg.tdm.blockSize              = tdmBlockSize;
     cfg.tdm.ldsBytes               = tdmLdsBytes;
+    cfg.tdm.useAsyncCopy           = tdmUseAsyncCopy;
 
     return cfg;
   }

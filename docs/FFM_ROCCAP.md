@@ -112,6 +112,103 @@ caps/transferbench_tdm_GBS_256_NSE_128_A2A_128M_2nproc_rank0_heap_bases.json
 ...
 ```
 
+## SDMA (DMA) all-to-all capture
+
+Uses the GPU **SDMA copy engine** via `hipMemcpyDeviceToDeviceNoCU` — not GFX or TDM
+kernels. Default `--disp` is `0-` (captures SDMA traffic, not shader dispatches).
+
+`GPU_MAX_HW_QUEUES` defaults to `NUM_GPU_DEVICES - 1` so all peer copies can run in
+parallel (override with `--gpu-max-hw-queues`).
+
+```bash
+./scripts/roccap_capture.py \
+  --use-dma-exec \
+  --num-gpu-devices 8 \
+  --tb-sim-heap-bytes 768M \
+  --num-iterations 1 \
+  --num-warmups 0 \
+  --dispatchlog \
+  --output-dir caps_mgpu \
+  a2a 36M
+```
+
+**Output (example):**
+
+```
+caps_mgpu/transferbench_ffm_dma_write_GMQ_7_A2A_36M_8nproc_rank0.cap
+caps_mgpu/transferbench_ffm_dma_write_GMQ_7_A2A_36M_8nproc_rank0_heap_bases.json
+...
+```
+
+For remote-read (executor on DST GPU):
+
+```bash
+./scripts/roccap_capture.py \
+  --use-remote-read 1 \
+  --use-dma-exec \
+  --num-gpu-devices 8 \
+  --tb-sim-heap-bytes 768M \
+  --num-iterations 1 \
+  --num-warmups 0 \
+  --dispatchlog \
+  --output-dir caps_mgpu \
+  a2a 36M
+```
+
+Batch run (6 configs, no 32-GPU) from the workspace parent directory:
+
+```bash
+/large_data/jonathou/transferbench_ffm_08042026/run_dma_sweep.sh
+```
+
+Log: `dma_sweep_run.log`
+
+## Async-to/from-LDS all-to-all capture
+
+Same `GpuTdmKernel` launch path as tensor TDM, but the copy body uses
+`async::tdmCopy` (`global_load_async_to_lds` / `global_store_async_from_lds`)
+instead of tensor TDM. One gfx1260 binary; select at runtime with `--use-async-exec`.
+
+| Mode | Flag | Kernel / ISA |
+|------|------|--------------|
+| GMEM / GFX | (default) | `GpuReduceKernel` |
+| Tensor TDM | `--use-tdm-exec` | `GpuTdmKernel` + tensor load/store |
+| Async LDS | `--use-async-exec` | `GpuTdmKernel` + async-to/from-LDS |
+| SDMA | `--use-dma-exec` | no shader dispatch |
+
+`--gfx-unroll`, `--gfx-temporal`, and `--gfx-scope` reuse the VMEM knobs:
+unroll selects the async hot-loop factor; temporal maps `GFX_TEMPORAL` 0–3 onto
+RT/NT load and store hints; scope maps `GFX_SCOPE` 0–3 onto WGP/SE/DEV/SYS
+(async defaults to SYS when unset).
+
+```bash
+./scripts/roccap_capture.py \
+  --use-async-exec \
+  --num-gpu-devices 2 \
+  --tb-sim-heap-bytes 768M \
+  --num-iterations 1 \
+  --num-warmups 0 \
+  --gfx-block-size 256 \
+  --gfx-unroll 32 \
+  --gfx-temporal 3 \
+  --gfx-scope sys \
+  --num-sub-exec 80 \
+  --dispatchlog \
+  --output-dir caps_mgpu \
+  a2a 256M
+```
+
+Remote-read:
+
+```bash
+./scripts/roccap_capture.py \
+  --use-remote-read 1 \
+  --use-async-exec \
+  ...
+```
+
+**Output (example):** `transferbench_ffm_async_write_GBS_256_UNROLL_32_NSE_80_TEMP_3_SCOPE_SYS_A2A_256M_2nproc_rank0.cap`
+
 ## Key environment variables
 
 | Variable | Purpose |
@@ -123,6 +220,12 @@ caps/transferbench_tdm_GBS_256_NSE_128_A2A_128M_2nproc_rank0_heap_bases.json
 | `TB_CAPTURE_EXECUTOR=N` | Capture only logical GPU N (set by wrapper per cap) |
 | `TB_HEAP_BASES_FILE` | Exact path for heap JSON (set by wrapper) |
 | `GFX_*` / `TDM_*` | Standard TransferBench kernel tuning |
+| `USE_DMA_EXEC=1` | SDMA executor (set by `--use-dma-exec`) |
+| `HSA_ENABLE_SDMA=1` | Required for real SDMA (wrapper sets when using `--use-dma-exec`) |
+| `GPU_MAX_HW_QUEUES` | Max parallel SDMA streams per GPU (auto `N-1` in wrapper) |
+| `USE_HSA_DMA=1` | HSA async copy instead of hipMemcpy (optional `--use-hsa-dma`) |
+| `USE_ASYNC_EXEC=1` | Async-to/from-LDS via `GpuTdmKernel` (set by `--use-async-exec`) |
+| `USE_ASYNC_COPY=1` | Select async backend inside TDM executor (also set by `--use-async-exec`) |
 
 Do **not** set `TB_ROCCAP_FAST_EXIT=1` — it truncates caps on FFM.
 

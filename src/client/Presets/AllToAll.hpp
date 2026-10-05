@@ -56,17 +56,29 @@ int AllToAllPreset(EnvVars&          ev,
   int showDetails   = EnvVars::GetEnvVar("SHOW_DETAILS"   , 0);
   int useDmaExec    = EnvVars::GetEnvVar("USE_DMA_EXEC"   , 0);
   int useTdmExec    = EnvVars::GetEnvVar("USE_TDM_EXEC"   , 0);
+  int useAsyncExec  = EnvVars::GetEnvVar("USE_ASYNC_EXEC" , 0);
   int useRemoteRead = EnvVars::GetEnvVar("USE_REMOTE_READ", 0);
 
-  // USE_DMA_EXEC and USE_TDM_EXEC are mutually exclusive; prefer DMA when both are requested
+  // Async LDS-staged copy reuses the TDM executor launch path (GpuTdmKernel).
+  if (useAsyncExec) {
+    useTdmExec = 1;
+    ev.tdmUseAsyncCopy = 1;
+  }
+
+  // Executor modes are mutually exclusive; prefer DMA > async/TDM > GFX
   if (useDmaExec && useTdmExec) {
-    Utils::Print("[WARN] Both USE_DMA_EXEC and USE_TDM_EXEC are set. Using DMA executor\n");
+    Utils::Print("[WARN] Both USE_DMA_EXEC and %s are set. Using DMA executor\n",
+                 useAsyncExec ? "USE_ASYNC_EXEC" : "USE_TDM_EXEC");
     useTdmExec = 0;
+    useAsyncExec = 0;
+    ev.tdmUseAsyncCopy = 0;
+  } else if (useAsyncExec && EnvVars::GetEnvVar("USE_TDM_EXEC", 0)) {
+    Utils::Print("[WARN] Both USE_ASYNC_EXEC and USE_TDM_EXEC are set. Using async-to/from-LDS backend\n");
   }
 
   // Determine which GPU executor to use
   ExeType     exeType    = useDmaExec ? EXE_GPU_DMA : (useTdmExec ? EXE_GPU_TDM : EXE_GPU_GFX);
-  char const* execName   = useDmaExec ? "DMA" : (useTdmExec ? "TDM" : "GFX");
+  char const* execName   = useDmaExec ? "DMA" : (useAsyncExec ? "ASYNC" : (useTdmExec ? "TDM" : "GFX"));
 
   // Check that all ranks have at least the number of GPUs requested
   // Warn if NIC configuration is slightly different from one another
@@ -119,7 +131,8 @@ int AllToAllPreset(EnvVars&          ev,
       ev.Print("NUM_SUB_EXEC"   , numSubExecs  , "Using %d subexecutors/CUs per Transfer", numSubExecs);
       ev.Print("SHOW_DETAILS"   , showDetails  , "%s full Test details", showDetails ? "Showing" : "Hiding");
       ev.Print("USE_DMA_EXEC"   , useDmaExec   , "Using %s executor", useDmaExec ? "DMA" : "GFX");
-      ev.Print("USE_TDM_EXEC"   , useTdmExec   , "Using %s executor", useTdmExec ? "TDM" : "GFX");
+      ev.Print("USE_TDM_EXEC"   , useTdmExec && !useAsyncExec, "Using %s executor", (useTdmExec && !useAsyncExec) ? "TDM" : "GFX");
+      ev.Print("USE_ASYNC_EXEC" , useAsyncExec , "Using %s executor", useAsyncExec ? "ASYNC (async-to/from-LDS)" : "GFX");
       ev.Print("USE_REMOTE_READ", useRemoteRead, "Using %s as executor", useRemoteRead ? "DST" : "SRC");
       printf("\n");
     }

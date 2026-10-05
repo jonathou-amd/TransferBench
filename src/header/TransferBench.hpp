@@ -82,6 +82,7 @@ THE SOFTWARE.
 #endif
 
 #include "tdmCopy.h"
+#include "asyncCopy.h"
 #include "Simulation.hpp"
 /// @endcond
 
@@ -246,6 +247,7 @@ namespace TransferBench
     vector<vector<int>> prefXccTable   = {};    ///< 2D table with preferred XCD to use for a specific [src][dst] GPU device
     int                 seType         = 0;     ///< SubExecutor granularity type (0=threadblock, 1=warp)
     int                 temporalMode   = 0;     ///< Non-temporal load/store mode 0=none, 1=load, 2=store, 3=both
+    int                 memScope       = -1;    ///< Mem scope (-1=unset/legacy VMEM; 0=WGP 1=SE 2=DEV 3=SYS). Async defaults to SYS when unset.
     int                 unrollFactor   = 4;     ///< GFX-kernel unroll factor
     int                 useSingleTeam  = 0;     ///< Team all subExecutors across the data array
     int                 waveOrder      = 0;     ///< GFX-kernel wavefront ordering
@@ -282,9 +284,10 @@ namespace TransferBench
 
   struct TdmOptions
   {
-    int blockOrder = 0;                         ///< Determines how threadblocks are ordered (0=sequential, 1=interleaved, 2=random)
-    int blockSize  = 256;                       ///< Size of each threadblock
-    int ldsBytes   = 0;                         ///< Amount of __shared__ memory per threadblock to use as bounce buffer (0 = device max)
+    int blockOrder   = 0;                       ///< Determines how threadblocks are ordered (0=sequential, 1=interleaved, 2=random)
+    int blockSize    = 256;                     ///< Size of each threadblock
+    int ldsBytes     = 0;                       ///< Amount of __shared__ memory per threadblock to use as bounce buffer (0 = device max)
+    int useAsyncCopy = 0;                       ///< 0=tensor TDM (tdm::tdmCopy); 1=async-to/from-LDS (async::tdmCopy)
   };
 
   /**
@@ -2048,6 +2051,7 @@ namespace {
       // gfx.perfXccTable is permitted to be different across ranks
       if (gfx.seType         != cfg.gfx.seType)         ADD_ERROR("cfg.gfx.seType");
       if (gfx.temporalMode   != cfg.gfx.temporalMode)   ADD_ERROR("cfg.gfx.temporalMode");
+      if (gfx.memScope       != cfg.gfx.memScope)       ADD_ERROR("cfg.gfx.memScope");
       if (gfx.unrollFactor   != cfg.gfx.unrollFactor)   ADD_ERROR("cfg.gfx.unrollFactor)");
       if (gfx.useSingleTeam  != cfg.gfx.useSingleTeam)  ADD_ERROR("cfg.gfx.useSingleTeam");
       if (gfx.waveOrder      != cfg.gfx.waveOrder)      ADD_ERROR("cfg.gfx.waveOrder");
@@ -2087,6 +2091,7 @@ namespace {
       if (tdm.blockOrder     != cfg.tdm.blockOrder)     ADD_ERROR("cfg.tdm.blockOrder");
       if (tdm.blockSize      != cfg.tdm.blockSize)      ADD_ERROR("cfg.tdm.blockSize");
       if (tdm.ldsBytes       != cfg.tdm.ldsBytes)       ADD_ERROR("cfg.tdm.ldsBytes");
+      if (tdm.useAsyncCopy   != cfg.tdm.useAsyncCopy)   ADD_ERROR("cfg.tdm.useAsyncCopy");
     }
     #undef ADD_ERROR
   }
@@ -2141,10 +2146,17 @@ namespace {
       errors.push_back({ERR_FATAL,
                         "[gfx.temporalMode] must be non-negative and less than or equal to 3"});
 
+    if (cfg.gfx.memScope < -1 || cfg.gfx.memScope > 3)
+      errors.push_back({ERR_FATAL,
+                        "[gfx.memScope] must be -1 (unset) or 0..3 (WGP/SE/DEV/SYS)"});
+
 #if defined(__NVCC__)
     if (cfg.gfx.temporalMode > 0)
       errors.push_back({ERR_FATAL,
           "[gfx.temporalMode] is not supported on NVIDIA hardware"});
+    if (cfg.gfx.memScope >= 0)
+      errors.push_back({ERR_FATAL,
+          "[gfx.memScope] is not supported on NVIDIA hardware"});
 #endif
 
     if (GetGpuKernelUnrollIdx(cfg.gfx.unrollFactor) == -1) {
@@ -2429,9 +2441,24 @@ namespace {
           hasFatalError = true;
           break;
         }
-        if (!tdm::IsTdmCopySupported(Simulation::PhysicalDeviceForQuery(t.exeDevice.exeIndex))) {
+        if (!tdm::IsTdmCopySupported(Simulation::PhysicalDeviceForQuery(t.exeDevice.exeIndex)) &&
+            !async::IsTdmCopySupported(Simulation::PhysicalDeviceForQuery(t.exeDevice.exeIndex))) {
           errors.push_back({ERR_FATAL,
-                            "Transfer %d: GPU TDM kernel requires TDM-capable hardware (gfx1250, gfx1260, or NVIDIA sm_90+), but GPU %d is not supported",
+                            "Transfer %d: GPU TDM/async kernel requires capable hardware "
+                            "(gfx1250/gfx1260 tensor TDM or async-to/from-LDS), but GPU %d is not supported",
+                            i, t.exeDevice.exeIndex});
+          hasFatalError = true;
+        } else if (cfg.tdm.useAsyncCopy &&
+                   !async::IsTdmCopySupported(Simulation::PhysicalDeviceForQuery(t.exeDevice.exeIndex))) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: USE_ASYNC_COPY requested but GPU %d lacks async-to/from-LDS support",
+                            i, t.exeDevice.exeIndex});
+          hasFatalError = true;
+        } else if (!cfg.tdm.useAsyncCopy &&
+                   !tdm::IsTdmCopySupported(Simulation::PhysicalDeviceForQuery(t.exeDevice.exeIndex))) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: GPU TDM kernel requires TDM-capable hardware "
+                            "(gfx1250, gfx1260, or NVIDIA sm_90+), but GPU %d is not supported",
                             i, t.exeDevice.exeIndex});
           hasFatalError = true;
         }
@@ -4972,83 +4999,156 @@ namespace {
   #define TEMPORAL_STORE 2
   #define TEMPORAL_BOTH  3
 
-  template <int TEMPORAL_MODE>
-  __device__ __forceinline__ void Load(float const* src, float& dst) {
-    if (TEMPORAL_MODE & TEMPORAL_LOAD) {
-#if !defined(__NVCC__)
-      dst = __builtin_nontemporal_load(src);
+  // GFX_SCOPE is a compile-time kernel template (-1=unset, 0=WGP, 1=SE, 2=DEV, 3=SYS).
+  // Scope must be constexpr: the amdgcn builtins take a string-literal scope, and a
+  // runtime switch leaves every scope's stores in the ISA (CU/wavefront plus SYS).
+  using VmemU32x4 = unsigned __attribute__((ext_vector_type(4)));
 
+#if !defined(__NVCC__)
+  template <int MEM_SCOPE>
+  __device__ __forceinline__ VmemU32x4 VmemScopedLoadB128(VmemU32x4 const* src)
+  {
+    if constexpr (MEM_SCOPE == 0)
+      return __builtin_amdgcn_global_load_b128((VmemU32x4*)src, "wavefront");
+    else if constexpr (MEM_SCOPE == 1)
+      return __builtin_amdgcn_global_load_b128((VmemU32x4*)src, "workgroup");
+    else if constexpr (MEM_SCOPE == 2)
+      return __builtin_amdgcn_global_load_b128((VmemU32x4*)src, "agent");
+    else
+      return __builtin_amdgcn_global_load_b128((VmemU32x4*)src, ""); // SYS
+  }
+
+  template <int MEM_SCOPE>
+  __device__ __forceinline__ void VmemScopedStoreB128(VmemU32x4* dst, VmemU32x4 val)
+  {
+    if constexpr (MEM_SCOPE == 0)
+      __builtin_amdgcn_global_store_b128(dst, val, "wavefront");
+    else if constexpr (MEM_SCOPE == 1)
+      __builtin_amdgcn_global_store_b128(dst, val, "workgroup");
+    else if constexpr (MEM_SCOPE == 2)
+      __builtin_amdgcn_global_store_b128(dst, val, "agent");
+    else
+      __builtin_amdgcn_global_store_b128(dst, val, ""); // SYS
+  }
+
+  template <int MEM_SCOPE>
+  __device__ __forceinline__ constexpr int VmemHipScope()
+  {
+    if constexpr (MEM_SCOPE == 0) return __HIP_MEMORY_SCOPE_WAVEFRONT;
+    else if constexpr (MEM_SCOPE == 1) return __HIP_MEMORY_SCOPE_WORKGROUP;
+    else if constexpr (MEM_SCOPE == 2) return __HIP_MEMORY_SCOPE_AGENT;
+    else return __HIP_MEMORY_SCOPE_SYSTEM;
+  }
 #endif
+
+  template <int TEMPORAL_MODE, int MEM_SCOPE>
+  __device__ __forceinline__ void Load(float const* src, float& dst) {
+#if !defined(__NVCC__)
+    if constexpr (MEM_SCOPE >= 0) {
+      dst = __hip_atomic_load(src, __ATOMIC_RELAXED, VmemHipScope<MEM_SCOPE>());
+    } else if constexpr (TEMPORAL_MODE & TEMPORAL_LOAD) {
+      dst = __builtin_nontemporal_load(src);
     } else {
       dst = *src;
     }
+#else
+    dst = *src;
+#endif
   }
 
-  template <int TEMPORAL_MODE>
+  template <int TEMPORAL_MODE, int MEM_SCOPE>
   __device__ __forceinline__ void Load(float2 const* src, float2& dst) {
-    if (TEMPORAL_MODE & TEMPORAL_LOAD) {
 #if !defined(__NVCC__)
+    if constexpr (MEM_SCOPE >= 0) {
+      constexpr int sc = VmemHipScope<MEM_SCOPE>();
+      dst.x = __hip_atomic_load(&src->x, __ATOMIC_RELAXED, sc);
+      dst.y = __hip_atomic_load(&src->y, __ATOMIC_RELAXED, sc);
+    } else if constexpr (TEMPORAL_MODE & TEMPORAL_LOAD) {
       dst.x = __builtin_nontemporal_load(&(src->x));
       dst.y = __builtin_nontemporal_load(&(src->y));
-#endif
     } else {
       dst = *src;
     }
+#else
+    dst = *src;
+#endif
   }
 
-  template <int TEMPORAL_MODE>
+  template <int TEMPORAL_MODE, int MEM_SCOPE>
   __device__ __forceinline__ void Load(float4 const* src, float4& dst) {
-    if (TEMPORAL_MODE & TEMPORAL_LOAD) {
 #if !defined(__NVCC__)
+    if constexpr (MEM_SCOPE >= 0) {
+      // Scoped global_load_b128. GFX_TEMPORAL applies only when scope is unset.
+      VmemU32x4 v = VmemScopedLoadB128<MEM_SCOPE>((VmemU32x4 const*)src);
+      __builtin_memcpy(&dst, &v, sizeof(dst));
+    } else if constexpr (TEMPORAL_MODE & TEMPORAL_LOAD) {
       dst.x = __builtin_nontemporal_load(&(src->x));
       dst.y = __builtin_nontemporal_load(&(src->y));
       dst.z = __builtin_nontemporal_load(&(src->z));
       dst.w = __builtin_nontemporal_load(&(src->w));
-#endif
     } else {
       dst = *src;
     }
+#else
+    dst = *src;
+#endif
   }
 
-  template <int TEMPORAL_MODE>
+  template <int TEMPORAL_MODE, int MEM_SCOPE>
   __device__ __forceinline__ void Store(float const& src, float* dst) {
-    if (TEMPORAL_MODE & TEMPORAL_STORE) {
 #if !defined(__NVCC__)
+    if constexpr (MEM_SCOPE >= 0) {
+      __hip_atomic_store(dst, src, __ATOMIC_RELAXED, VmemHipScope<MEM_SCOPE>());
+    } else if constexpr (TEMPORAL_MODE & TEMPORAL_STORE) {
       __builtin_nontemporal_store(src, dst);
-#endif
     } else {
       *dst = src;
     }
+#else
+    *dst = src;
+#endif
   }
 
-  template <int TEMPORAL_MODE>
+  template <int TEMPORAL_MODE, int MEM_SCOPE>
   __device__ __forceinline__ void Store(float2 const& src, float2* dst) {
-    if (TEMPORAL_MODE & TEMPORAL_STORE) {
 #if !defined(__NVCC__)
+    if constexpr (MEM_SCOPE >= 0) {
+      constexpr int sc = VmemHipScope<MEM_SCOPE>();
+      __hip_atomic_store(&dst->x, src.x, __ATOMIC_RELAXED, sc);
+      __hip_atomic_store(&dst->y, src.y, __ATOMIC_RELAXED, sc);
+    } else if constexpr (TEMPORAL_MODE & TEMPORAL_STORE) {
       __builtin_nontemporal_store(src.x, &(dst->x));
       __builtin_nontemporal_store(src.y, &(dst->y));
-#endif
     } else {
       *dst = src;
     }
+#else
+    *dst = src;
+#endif
   }
 
-  template <int TEMPORAL_MODE>
+  template <int TEMPORAL_MODE, int MEM_SCOPE>
   __device__ __forceinline__ void Store(float4 const& src, float4* dst) {
-    if (TEMPORAL_MODE & TEMPORAL_STORE) {
 #if !defined(__NVCC__)
+    if constexpr (MEM_SCOPE >= 0) {
+      VmemU32x4 v;
+      __builtin_memcpy(&v, &src, sizeof(src));
+      VmemScopedStoreB128<MEM_SCOPE>((VmemU32x4*)dst, v);
+    } else if constexpr (TEMPORAL_MODE & TEMPORAL_STORE) {
       __builtin_nontemporal_store(src.x, &(dst->x));
       __builtin_nontemporal_store(src.y, &(dst->y));
       __builtin_nontemporal_store(src.z, &(dst->z));
       __builtin_nontemporal_store(src.w, &(dst->w));
-#endif
     } else {
       *dst = src;
     }
+#else
+    *dst = src;
+#endif
   }
 
   // Simplified Kernel for GFX execution for copies only
-  template <typename PACKED_FLOAT, int LAUNCH_BOUND, int UNROLL, int TEMPORAL_MODE>
+  template <typename PACKED_FLOAT, int LAUNCH_BOUND, int UNROLL, int TEMPORAL_MODE, int MEM_SCOPE>
   __global__ void __launch_bounds__(LAUNCH_BOUND)
     GpuCopyKernel(SubExecParam* params, int seType, int waveOrder, int numSubIterations)
   {
@@ -5132,14 +5232,14 @@ namespace {
           if (hasSrc) {
             #pragma unroll
             for (int u = 0; u < UNROLL; u++)
-              Load<TEMPORAL_MODE>(&srcFloatPacked[idx + u * unrlStride * warpSize], val[u]);
+              Load<TEMPORAL_MODE, MEM_SCOPE>(&srcFloatPacked[idx + u * unrlStride * warpSize], val[u]);
           }
 
           // Write accumulation to all outputs
           if (hasDst) {
             #pragma unroll
             for (int u = 0; u < UNROLL; u++)
-              Store<TEMPORAL_MODE>(val[u], &dstFloatPacked[idx + u * unrlStride * warpSize]);
+              Store<TEMPORAL_MODE, MEM_SCOPE>(val[u], &dstFloatPacked[idx + u * unrlStride * warpSize]);
           }
         }
       }
@@ -5154,10 +5254,10 @@ namespace {
           for (size_t idx = loop1Limit + (teamIdx * teamStride2 + waveIdx * waveStride2) * warpSize + tIdx;
                idx < numPackedFloat; idx += loop2Stride) {
             if (hasSrc) {
-              Load<TEMPORAL_MODE>(&srcFloatPacked[idx], val);
+              Load<TEMPORAL_MODE, MEM_SCOPE>(&srcFloatPacked[idx], val);
             }
             if (hasDst) {
-              Store<TEMPORAL_MODE>(val, &dstFloatPacked[idx]);
+              Store<TEMPORAL_MODE, MEM_SCOPE>(val, &dstFloatPacked[idx]);
             }
           }
         }
@@ -5172,11 +5272,11 @@ namespace {
           size_t const loop3Stride = nTeams * nWaves * warpSize;
           for (size_t idx = numPackedFloat * (sizeof(PACKED_FLOAT)/sizeof(float)) + (teamIdx * teamStride2 + waveIdx * waveStride2) * warpSize + tIdx; idx < p.N; idx += loop3Stride) {
             if (hasSrc) {
-              Load<TEMPORAL_MODE>(&p.src[0][idx], val);
+              Load<TEMPORAL_MODE, MEM_SCOPE>(&p.src[0][idx], val);
             }
 
             if (hasDst) {
-              Store<TEMPORAL_MODE>(val, &p.dst[0][idx]);
+              Store<TEMPORAL_MODE, MEM_SCOPE>(val, &p.dst[0][idx]);
             }
           }
         }
@@ -5211,7 +5311,7 @@ namespace {
   }
 
   // Kernel for GFX execution
-  template <typename PACKED_FLOAT, int LAUNCH_BOUND, int UNROLL, int TEMPORAL_MODE>
+  template <typename PACKED_FLOAT, int LAUNCH_BOUND, int UNROLL, int TEMPORAL_MODE, int MEM_SCOPE>
   __global__ void __launch_bounds__(LAUNCH_BOUND)
     GpuReduceKernel(SubExecParam* params, int seType, int waveOrder, int numSubIterations)
   {
@@ -5298,12 +5398,12 @@ namespace {
           if (numSrcs) {
             #pragma unroll
             for (int u = 0; u < UNROLL; u++)
-              Load<TEMPORAL_MODE>(&srcFloatPacked[0][idx + u * unrlStride * warpSize], val[u]);
+              Load<TEMPORAL_MODE, MEM_SCOPE>(&srcFloatPacked[0][idx + u * unrlStride * warpSize], val[u]);
 
             for (int s = 1; s < numSrcs; s++) {
               #pragma unroll
               for (int u = 0; u < UNROLL; u++)
-                Load<TEMPORAL_MODE>(&srcFloatPacked[s][idx + u * unrlStride * warpSize], tmp[u]);
+                Load<TEMPORAL_MODE, MEM_SCOPE>(&srcFloatPacked[s][idx + u * unrlStride * warpSize], tmp[u]);
               #pragma unroll
               for (int u = 0; u < UNROLL; u++)
                 val[u] += tmp[u];
@@ -5314,7 +5414,7 @@ namespace {
           for (int d = 0; d < numDsts; d++) {
             #pragma unroll
             for (int u = 0; u < UNROLL; u++)
-              Store<TEMPORAL_MODE>(val[u], &dstFloatPacked[d][idx + u * unrlStride * warpSize]);
+              Store<TEMPORAL_MODE, MEM_SCOPE>(val[u], &dstFloatPacked[d][idx + u * unrlStride * warpSize]);
           }
         }
       }
@@ -5329,14 +5429,14 @@ namespace {
           for (size_t idx = loop1Limit + (teamIdx * teamStride2 + waveIdx * waveStride2) * warpSize + tIdx;
                idx < numPackedFloat; idx += loop2Stride) {
             if (numSrcs) {
-              Load<TEMPORAL_MODE>(&srcFloatPacked[0][idx], val);
+              Load<TEMPORAL_MODE, MEM_SCOPE>(&srcFloatPacked[0][idx], val);
               for (int s = 1; s < numSrcs; s++) {
-                Load<TEMPORAL_MODE>(&srcFloatPacked[s][idx], tmp);
+                Load<TEMPORAL_MODE, MEM_SCOPE>(&srcFloatPacked[s][idx], tmp);
                 val += tmp;
               }
             }
             for (int d = 0; d < numDsts; d++)
-              Store<TEMPORAL_MODE>(val, &dstFloatPacked[d][idx]);
+              Store<TEMPORAL_MODE, MEM_SCOPE>(val, &dstFloatPacked[d][idx]);
           }
         }
       }
@@ -5350,15 +5450,15 @@ namespace {
           size_t const loop3Stride = nTeams * nWaves * warpSize;
           for (size_t idx = numPackedFloat * (sizeof(PACKED_FLOAT)/sizeof(float)) + (teamIdx * teamStride2 + waveIdx * waveStride2) * warpSize + tIdx; idx < p.N; idx += loop3Stride) {
             if (numSrcs) {
-              Load<TEMPORAL_MODE>(&p.src[0][idx], val);
+              Load<TEMPORAL_MODE, MEM_SCOPE>(&p.src[0][idx], val);
               for (int s = 1; s < numSrcs; s++) {
-                Load<TEMPORAL_MODE>(&p.src[s][idx], tmp);
+                Load<TEMPORAL_MODE, MEM_SCOPE>(&p.src[s][idx], tmp);
                 val += tmp;
               }
             }
 
             for (int d = 0; d < numDsts; d++)
-              Store<TEMPORAL_MODE>(val, &p.dst[d][idx]);
+              Store<TEMPORAL_MODE, MEM_SCOPE>(val, &p.dst[d][idx]);
           }
         }
       }
@@ -5392,17 +5492,17 @@ namespace {
   }
 
   // Must match ordering in GfxKernelType
-#define GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL) \
-  {GpuReduceKernel<DWORD, LAUNCH_BOUND, UNROLL, TEMPORAL>,            \
-   GpuCopyKernel  <DWORD, LAUNCH_BOUND, UNROLL, TEMPORAL>}
+#define GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL, SCOPE) \
+  {GpuReduceKernel<DWORD, LAUNCH_BOUND, UNROLL, TEMPORAL, SCOPE>,            \
+   GpuCopyKernel  <DWORD, LAUNCH_BOUND, UNROLL, TEMPORAL, SCOPE>}
 
   // Must match mapping in GetGpuKernelTemporalIdx
   constexpr int KERN_TEMPORALS = 4;
-#define GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, DWORD)           \
-  {GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_NONE),  \
-   GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_LOAD),  \
-   GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_STORE), \
-   GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_BOTH)}
+#define GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, DWORD, SCOPE)           \
+  {GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_NONE,  SCOPE), \
+   GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_LOAD,  SCOPE), \
+   GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_STORE, SCOPE), \
+   GPU_KERNEL_KERNEL_DECL(LAUNCH_BOUND, UNROLL, DWORD, TEMPORAL_BOTH,  SCOPE)}
 
   int GetGpuKernelTemporalIdx(int temporalMode) {
     if (temporalMode == TEMPORAL_NONE)  return 0;
@@ -5412,12 +5512,27 @@ namespace {
     return -1;
   }
 
+  // Must match mapping in GetGpuKernelScopeIdx. -1,0,1,2,3
+  constexpr int KERN_SCOPES = 5;
+#define GPU_KERNEL_SCOPE_DECL(LAUNCH_BOUND, UNROLL, DWORD)     \
+  {GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, DWORD, -1),  \
+   GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, DWORD,  0),  \
+   GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, DWORD,  1),  \
+   GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, DWORD,  2),  \
+   GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, DWORD,  3)}
+
+  int GetGpuKernelScopeIdx(int memScope) {
+    if (memScope < 0) return 0;
+    if (memScope <= 3) return memScope + 1;
+    return -1;
+  }
+
   // Must match mapping in GetGpuKernelWordsizeIdx
   constexpr int KERN_WORDSIZES = 3;
-#define GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, UNROLL)        \
-  {GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, float),  \
-   GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, float2), \
-   GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, float4)}
+#define GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, UNROLL)      \
+  {GPU_KERNEL_SCOPE_DECL(LAUNCH_BOUND, UNROLL, float),   \
+   GPU_KERNEL_SCOPE_DECL(LAUNCH_BOUND, UNROLL, float2),  \
+   GPU_KERNEL_SCOPE_DECL(LAUNCH_BOUND, UNROLL, float4)}
 
   int GetGpuKernelWordsizeIdx(int wordsize) {
     if (wordsize == 1) return 0;
@@ -5427,7 +5542,7 @@ namespace {
   }
 
   // Must match mapping in GetGpuKernelUnrollIdx
-  constexpr int KERN_UNROLLS = 11;
+  constexpr int KERN_UNROLLS = 13;
 #define GPU_KERNEL_UNROLL_DECL(LAUNCH_BOUND) \
   {GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  1),  \
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  2),  \
@@ -5439,6 +5554,8 @@ namespace {
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  8),  \
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 16),  \
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 32),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 48),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 56),  \
    GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 64)}
 
   // Must match the unroll mapping in GPU_KERNEL_UNROLL_DECL
@@ -5446,7 +5563,9 @@ namespace {
     if (1 <= unroll && unroll <= 8) return unroll - 1;
     if (unroll == 16)               return 8;
     if (unroll == 32)               return 9;
-    if (unroll == 64)               return 10;
+    if (unroll == 48)               return 10;
+    if (unroll == 56)               return 11;
+    if (unroll == 64)               return 12;
     return -1;
   }
 
@@ -5454,7 +5573,7 @@ namespace {
   typedef void (*GpuKernelFuncPtr)(SubExecParam*, int, int, int);
   constexpr int KERN_BOUNDS = 4;
 #ifndef SINGLE_KERNEL
-  GpuKernelFuncPtr GpuKernelsTable[KERN_BOUNDS][KERN_UNROLLS][KERN_WORDSIZES][KERN_TEMPORALS][NUM_GFX_KERNELS] =
+  GpuKernelFuncPtr GpuKernelsTable[KERN_BOUNDS][KERN_UNROLLS][KERN_WORDSIZES][KERN_SCOPES][KERN_TEMPORALS][NUM_GFX_KERNELS] =
   {
     GPU_KERNEL_UNROLL_DECL(256),
     GPU_KERNEL_UNROLL_DECL(512),
@@ -5465,6 +5584,7 @@ namespace {
 
   #undef GPU_KERNEL_UNROLL_DECL
   #undef GPU_KERNEL_DWORD_DECL
+  #undef GPU_KERNEL_SCOPE_DECL
   #undef GPU_KERNEL_TEMPORAL_DECL
 
   int GetGpuKernelBlocksizeIdx(int blocksize) {
@@ -5489,11 +5609,12 @@ namespace {
     [[maybe_unused]] int const unrollIdx    = GetGpuKernelUnrollIdx(cfg.gfx.unrollFactor);
     [[maybe_unused]] int const wordSizeIdx  = GetGpuKernelWordsizeIdx(cfg.gfx.wordSize);
     [[maybe_unused]] int const temporalIdx  = GetGpuKernelTemporalIdx(cfg.gfx.temporalMode);
+    [[maybe_unused]] int const scopeIdx     = GetGpuKernelScopeIdx(cfg.gfx.memScope);
 
 #ifdef SINGLE_KERNEL
-    auto gpuKernel = GpuReduceKernel<float4, 1024, 1, 0>;
+    auto gpuKernel = GpuReduceKernel<float4, 1024, 1, 0, -1>;
 #else
-    auto gpuKernel = GpuKernelsTable[blockSizeIdx][unrollIdx][wordSizeIdx][temporalIdx][gfxKernelIdx];
+    auto gpuKernel = GpuKernelsTable[blockSizeIdx][unrollIdx][wordSizeIdx][scopeIdx][temporalIdx][gfxKernelIdx];
 #endif
 
     // Compute kernel launch parameters
@@ -5509,14 +5630,16 @@ namespace {
 #if defined(__NVCC__)
     if (cfg.general.useHipEvents)
       ERR_CHECK(hipEventRecord(startEvent, stream));
-    gpuKernel<<<gridSize, blockSize, 0 , stream>>>(params, cfg.gfx.seType, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+    gpuKernel<<<gridSize, blockSize, 0 , stream>>>(params, cfg.gfx.seType, cfg.gfx.waveOrder,
+                                                   cfg.general.numSubIterations);
     if (cfg.general.useHipEvents)
       ERR_CHECK(hipEventRecord(stopEvent, stream));
 #else
     hipExtLaunchKernelGGL(gpuKernel, gridSize, blockSize, 0, stream,
                           cfg.general.useHipEvents ? startEvent : NULL,
                           cfg.general.useHipEvents ? stopEvent  : NULL, 0,
-                          params, cfg.gfx.seType, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+                          params, cfg.gfx.seType, cfg.gfx.waveOrder,
+                          cfg.general.numSubIterations);
 #endif
 
     // Always wait for the kernel on its stream so roccap can finalize the trace.
@@ -5876,10 +5999,85 @@ namespace {
 
 // TDM Executor-related functions
 //========================================================================================
-#if TDM_SUPPORTED
+// GpuTdmKernel hosts either tensor-TDM (tdm::tdmCopy) or async-to/from-LDS
+// (async::tdmCopy) copies. Runtime selection via cfg.tdm.useAsyncCopy /
+// USE_ASYNC_COPY so a single gfx1260 binary can run either path.
+#if TDM_SUPPORTED || ASYNC_COPY_SUPPORTED
+  // Map GFX_TEMPORAL (0..3) + GFX_SCOPE onto async load/store CachePolicy pairs.
+  // Scope defaults to SYS when GFX_SCOPE is unset (prior async default).
+  template <int Unroll, CachePolicy LoadCp, CachePolicy StoreCp>
+  __device__ inline void AsyncTdmCopyPolicied(void* dst, const void* src, size_t sizeBytes,
+                                              void* shmem, size_t ldsBytes)
+  {
+#if ASYNC_COPY_SUPPORTED
+    async::tdmCopy<Unroll, LoadCp, StoreCp>(dst, src, sizeBytes, shmem, ldsBytes);
+#else
+    (void)dst; (void)src; (void)sizeBytes; (void)shmem; (void)ldsBytes;
+#endif
+  }
+
+  template <int Unroll, MemScope Scope>
+  __device__ inline void AsyncTdmCopySelectTemporal(int temporal, void* dst, const void* src,
+                                                    size_t sizeBytes, void* shmem, size_t ldsBytes)
+  {
+    constexpr CachePolicy kRt = createCachePolicy(TemporalHint::RT, Scope);
+    constexpr CachePolicy kNt = createCachePolicy(TemporalHint::NT, Scope);
+    switch (temporal) {
+      case 1:  // NT load, RT store
+        AsyncTdmCopyPolicied<Unroll, kNt, kRt>(dst, src, sizeBytes, shmem, ldsBytes);
+        break;
+      case 2:  // RT load, NT store
+        AsyncTdmCopyPolicied<Unroll, kRt, kNt>(dst, src, sizeBytes, shmem, ldsBytes);
+        break;
+      case 3:  // NT load, NT store
+        AsyncTdmCopyPolicied<Unroll, kNt, kNt>(dst, src, sizeBytes, shmem, ldsBytes);
+        break;
+      default: // 0: RT load, RT store
+        AsyncTdmCopyPolicied<Unroll, kRt, kRt>(dst, src, sizeBytes, shmem, ldsBytes);
+        break;
+    }
+  }
+
+  template <int Unroll>
+  __device__ inline void AsyncTdmCopySelectScope(int scope, int temporal, void* dst, const void* src,
+                                                 size_t sizeBytes, void* shmem, size_t ldsBytes)
+  {
+    switch (scope) {
+      case 0:  AsyncTdmCopySelectTemporal<Unroll, MemScope::WGP>(temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 1:  AsyncTdmCopySelectTemporal<Unroll, MemScope::SE >(temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 2:  AsyncTdmCopySelectTemporal<Unroll, MemScope::DEV>(temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      default: AsyncTdmCopySelectTemporal<Unroll, MemScope::SYS>(temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+    }
+  }
+
+  __device__ inline void AsyncTdmCopySelect(int unroll, int temporal, int scope, void* dst, const void* src,
+                                            size_t sizeBytes, void* shmem, size_t ldsBytes)
+  {
+    switch (unroll) {
+      case 1:  AsyncTdmCopySelectScope<1 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 2:  AsyncTdmCopySelectScope<2 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 3:  AsyncTdmCopySelectScope<3 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 4:  AsyncTdmCopySelectScope<4 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 5:  AsyncTdmCopySelectScope<5 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 6:  AsyncTdmCopySelectScope<6 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 7:  AsyncTdmCopySelectScope<7 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 8:  AsyncTdmCopySelectScope<8 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 16: AsyncTdmCopySelectScope<16>(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 32: AsyncTdmCopySelectScope<32>(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 48: AsyncTdmCopySelectScope<48>(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 56: AsyncTdmCopySelectScope<56>(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      case 64: AsyncTdmCopySelectScope<64>(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+      default: AsyncTdmCopySelectScope<2 >(scope, temporal, dst, src, sizeBytes, shmem, ldsBytes); break;
+    }
+  }
+
   __global__ void  GpuTdmKernel(SubExecParam* params,
                                 uint32_t      ldsBytes,
-                                int           numSubIterations)
+                                int           numSubIterations,
+                                int           useAsyncCopy,
+                                int           hotLoopUnroll,
+                                int           temporalMode,
+                                int           memScope)
   {
 //    int64_t startCycle;
 //    bool const shouldRecordTiming = (threadIdx.x == 0);
@@ -5897,7 +6095,15 @@ namespace {
 
     int subIterations = 0;
     while (1) {
-      tdm::tdmCopy(dst, src, sizeBytes, shmem, ldsBytes);
+      if (useAsyncCopy) {
+        AsyncTdmCopySelect(hotLoopUnroll, temporalMode, memScope, dst, src, sizeBytes, shmem, ldsBytes);
+      } else {
+#if TDM_SUPPORTED
+        tdm::tdmCopy(dst, src, sizeBytes, shmem, ldsBytes);
+#else
+        (void)dst; (void)src; (void)sizeBytes;
+#endif
+      }
 //      __syncthreads(); // Wait for all warps to finish
       if (++subIterations == numSubIterations) break;
     }
@@ -5911,11 +6117,11 @@ namespace {
 //    }
   }
 #else
-  // gfx1250 tensor TDM builtins unavailable for this translation: emit empty kernel stubs with
-  // the exact launch signatures so the host-side launch path still links. They are never
-  // dispatched on non-gfx1250 or nvidia hardware (see TransfersHaveErrors).
-  __global__ void GpuTdmKernel(SubExecParam*, uint32_t, int) {}
-#endif // TDM_SUPPORTED
+  // Neither tensor TDM nor async-to/from-LDS builtins available for this
+  // translation: emit empty kernel stubs with the exact launch signatures so the
+  // host-side launch path still links.
+  __global__ void GpuTdmKernel(SubExecParam*, uint32_t, int, int, int, int, int) {}
+#endif // TDM_SUPPORTED || ASYNC_COPY_SUPPORTED
 
   static ErrResult ExecuteTdmTransfer(int           const  iteration,
                                       int           const  exeTotalSubExecs,
@@ -5933,6 +6139,12 @@ namespace {
     dim3 const gridSize(numSubExecs);
     dim3 const blockSize(cfg.tdm.blockSize);
     SubExecParam* params = cfg.general.useMultiStream ? rss.subExecParamGpuPtr : exeSubExecParam;
+    int const useAsyncCopy = cfg.tdm.useAsyncCopy ? 1 : 0;
+    // Reuse GFX_UNROLL / GFX_TEMPORAL / GFX_SCOPE for async hot-loop, NT hints, and mem scope.
+    int const hotLoopUnroll = cfg.gfx.unrollFactor > 0 ? cfg.gfx.unrollFactor : 2;
+    int const temporalMode  = cfg.gfx.temporalMode;
+    // Unset (-1) keeps prior async default of SYS.
+    int const memScope      = cfg.gfx.memScope >= 0 ? cfg.gfx.memScope : 3;
 
     auto cpuStart = std::chrono::high_resolution_clock::now();
 
@@ -5941,13 +6153,18 @@ namespace {
       ERR_CHECK(hipEventRecord(startEvent, stream));
     GpuTdmKernel<<<gridSize, blockSize, ldsBytes, stream>>>(params,
                                                             ldsBytes,
-                                                            cfg.general.numSubIterations);
+                                                            cfg.general.numSubIterations,
+                                                            useAsyncCopy,
+                                                            hotLoopUnroll,
+                                                            temporalMode,
+                                                            memScope);
     if (cfg.general.useHipEvents)
       ERR_CHECK(hipEventRecord(stopEvent, stream));
 #else
     hipExtLaunchKernelGGL(GpuTdmKernel, gridSize, blockSize, (int)ldsBytes, stream,
                           startEvent, stopEvent, 0,
-                          params, ldsBytes, cfg.general.numSubIterations);
+                          params, ldsBytes, cfg.general.numSubIterations,
+                          useAsyncCopy, hotLoopUnroll, temporalMode, memScope);
 #endif
     ERR_CHECK(hipStreamSynchronize(stream));
 
