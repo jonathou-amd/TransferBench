@@ -288,6 +288,7 @@ namespace TransferBench
     int blockSize    = 256;                     ///< Size of each threadblock
     int ldsBytes     = 0;                       ///< Amount of __shared__ memory per threadblock to use as bounce buffer (0 = device max)
     int useAsyncCopy = 0;                       ///< 0=tensor TDM (tdm::tdmCopy); 1=async-to/from-LDS (async::tdmCopy)
+    int mixTdmWarps  = 0;                       ///< 0=all warps TDM; M>0: first M warps tensor-TDM, rest VMEM (same N)
   };
 
   /**
@@ -2092,6 +2093,7 @@ namespace {
       if (tdm.blockSize      != cfg.tdm.blockSize)      ADD_ERROR("cfg.tdm.blockSize");
       if (tdm.ldsBytes       != cfg.tdm.ldsBytes)       ADD_ERROR("cfg.tdm.ldsBytes");
       if (tdm.useAsyncCopy   != cfg.tdm.useAsyncCopy)   ADD_ERROR("cfg.tdm.useAsyncCopy");
+      if (tdm.mixTdmWarps    != cfg.tdm.mixTdmWarps)    ADD_ERROR("cfg.tdm.mixTdmWarps");
     }
     #undef ADD_ERROR
   }
@@ -5999,9 +6001,10 @@ namespace {
 
 // TDM Executor-related functions
 //========================================================================================
-// GpuTdmKernel hosts either tensor-TDM (tdm::tdmCopy) or async-to/from-LDS
-// (async::tdmCopy) copies. Runtime selection via cfg.tdm.useAsyncCopy /
-// USE_ASYNC_COPY so a single gfx1260 binary can run either path.
+// TDM executor kernels (separate so VGPR budgets do not merge across modes):
+//   GpuTdmKernel      — pure tensor-TDM (tdm::tdmCopy)
+//   GpuAsyncTdmKernel — async-to/from-LDS (async::tdmCopy)
+//   GpuTdmMixKernel   — warp-specialized mix (tdmCopyByTeam + VMEM), templated
 #if TDM_SUPPORTED || ASYNC_COPY_SUPPORTED
   // Map GFX_TEMPORAL (0..3) + GFX_SCOPE onto async load/store CachePolicy pairs.
   // Scope defaults to SYS when GFX_SCOPE is unset (prior async default).
@@ -6071,21 +6074,76 @@ namespace {
     }
   }
 
-  __global__ void  GpuTdmKernel(SubExecParam* params,
-                                uint32_t      ldsBytes,
-                                int           numSubIterations,
-                                int           useAsyncCopy,
-                                int           hotLoopUnroll,
-                                int           temporalMode,
-                                int           memScope)
+  // VMEM half of MIX_TDM_WARPS: copy nFloats starting at src/dst, striped across
+  // warps [teamStartWarp, nWaves). Uses float4 packed loads when possible.
+  template <int UNROLL, int TEMPORAL_MODE, int MEM_SCOPE>
+  __device__ inline void VmemCopySubrange(float const* __restrict__ src,
+                                          float*       __restrict__ dst,
+                                          size_t                    nFloats,
+                                          int                       teamStartWarp,
+                                          int                       nWaves)
   {
-//    int64_t startCycle;
-//    bool const shouldRecordTiming = (threadIdx.x == 0);
-//    if (shouldRecordTiming) startCycle = GetTimestamp();
+    int const wSize   = (int)warpSize;
+    int const warpId  = (int)threadIdx.x / wSize;
+    if (warpId < teamStartWarp || nFloats == 0) return;
 
+    int const vmemWaves = nWaves - teamStartWarp;
+    if (vmemWaves <= 0) return;
+
+    int const waveIdx = warpId - teamStartWarp;
+    int const tIdx    = (int)threadIdx.x % wSize;
+
+    using PACKED = float4;
+    constexpr size_t elemsPerPacked = sizeof(PACKED) / sizeof(float);
+
+    PACKED const* __restrict__ srcP = (PACKED const*)src;
+    PACKED*       __restrict__ dstP = (PACKED*)dst;
+
+    size_t const numPacked   = nFloats / elemsPerPacked;
+    size_t const loop1Stride = (size_t)vmemWaves * UNROLL * (size_t)wSize;
+    size_t const loop1Limit  = (loop1Stride == 0) ? 0 : (numPacked / loop1Stride) * loop1Stride;
+
+    {
+      PACKED val[UNROLL];
+      for (size_t idx = ((size_t)waveIdx * UNROLL) * (size_t)wSize + (size_t)tIdx;
+           idx < loop1Limit; idx += loop1Stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++)
+          Load<TEMPORAL_MODE, MEM_SCOPE>(&srcP[idx + (size_t)u * (size_t)wSize], val[u]);
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++)
+          Store<TEMPORAL_MODE, MEM_SCOPE>(val[u], &dstP[idx + (size_t)u * (size_t)wSize]);
+      }
+    }
+
+    if (loop1Limit < numPacked) {
+      PACKED val;
+      size_t const loop2Stride = (size_t)vmemWaves * (size_t)wSize;
+      for (size_t idx = loop1Limit + (size_t)waveIdx * (size_t)wSize + (size_t)tIdx;
+           idx < numPacked; idx += loop2Stride) {
+        Load<TEMPORAL_MODE, MEM_SCOPE>(&srcP[idx], val);
+        Store<TEMPORAL_MODE, MEM_SCOPE>(val, &dstP[idx]);
+      }
+    }
+
+    size_t const packedFloats = numPacked * elemsPerPacked;
+    if (packedFloats < nFloats) {
+      float val;
+      size_t const loop3Stride = (size_t)vmemWaves * (size_t)wSize;
+      for (size_t idx = packedFloats + (size_t)waveIdx * (size_t)wSize + (size_t)tIdx;
+           idx < nFloats; idx += loop3Stride) {
+        Load<TEMPORAL_MODE, MEM_SCOPE>(&src[idx], val);
+        Store<TEMPORAL_MODE, MEM_SCOPE>(val, &dst[idx]);
+      }
+    }
+  }
+
+  // Pure tensor-TDM (all warps). Kept separate from async/mix so VGPR budgets do not merge.
+  __global__ void GpuTdmKernel(SubExecParam* params,
+                               uint32_t      ldsBytes,
+                               int           numSubIterations)
+  {
     extern __shared__ __align__(128) float shmem[];
-
-    // Each threadblock is a subexecutor (mirrors GpuCopyKernel).
     SubExecParam& p = params[blockIdx.x];
     if (p.N == 0) return;
 
@@ -6095,33 +6153,267 @@ namespace {
 
     int subIterations = 0;
     while (1) {
-      if (useAsyncCopy) {
-        AsyncTdmCopySelect(hotLoopUnroll, temporalMode, memScope, dst, src, sizeBytes, shmem, ldsBytes);
-      } else {
 #if TDM_SUPPORTED
-        tdm::tdmCopy(dst, src, sizeBytes, shmem, ldsBytes);
+      tdm::tdmCopy(dst, src, sizeBytes, shmem, ldsBytes);
 #else
-        (void)dst; (void)src; (void)sizeBytes;
+      (void)dst; (void)src; (void)sizeBytes; (void)shmem; (void)ldsBytes;
 #endif
-      }
-//      __syncthreads(); // Wait for all warps to finish
       if (++subIterations == numSubIterations) break;
     }
-
-//    if (shouldRecordTiming) {
-//      __threadfence_system();
-//      p.stopCycle  = GetTimestamp();
-//      p.startCycle = startCycle;
-//      GetHwId(p.hwId);
-//      GetXccId(p.xccId);
-//    }
   }
+
+  // Async-to/from-LDS only (runtime unroll/temporal/scope select).
+  __global__ void GpuAsyncTdmKernel(SubExecParam* params,
+                                    uint32_t      ldsBytes,
+                                    int           numSubIterations,
+                                    int           hotLoopUnroll,
+                                    int           temporalMode,
+                                    int           memScope)
+  {
+    extern __shared__ __align__(128) float shmem[];
+    SubExecParam& p = params[blockIdx.x];
+    if (p.N == 0) return;
+
+    float const* __restrict__ src = (float const*)p.src[0];
+    float*       __restrict__ dst = (float*)p.dst[0];
+    size_t const sizeBytes        = p.N * sizeof(float);
+
+    int subIterations = 0;
+    while (1) {
+      AsyncTdmCopySelect(hotLoopUnroll, temporalMode, memScope, dst, src, sizeBytes, shmem, ldsBytes);
+      if (++subIterations == numSubIterations) break;
+    }
+  }
+
+  // Warp-specialized mix: one compile-time VMEM specialization per kernel instance.
+  // TDM warps use tdmCopyByTeam (other warps return immediately); VMEM warps only
+  // run VmemCopySubrange. Separating from GpuTdmKernel / GpuAsyncTdmKernel avoids
+  // max-of-all-paths VGPR / scratch pressure from unused async and unroll switches.
+  template <int UNROLL, int TEMPORAL_MODE, int MEM_SCOPE>
+  __global__ void GpuTdmMixKernel(SubExecParam* params,
+                                  uint32_t      ldsBytes,
+                                  int           numSubIterations,
+                                  int           mixTdmWarps)
+  {
+    extern __shared__ __align__(128) float shmem[];
+    SubExecParam& p = params[blockIdx.x];
+    if (p.N == 0) return;
+
+    float const* __restrict__ src = (float const*)p.src[0];
+    float*       __restrict__ dst = (float*)p.dst[0];
+
+    int const nWaves = (int)(blockDim.x / warpSize);
+    int const M      = (mixTdmWarps > 0)
+                         ? ((mixTdmWarps < nWaves) ? mixTdmWarps : nWaves)
+                         : 0;
+    if (M <= 0 || M >= nWaves) return;
+
+    // TDM bulk is 256B rows; round K down so the TDM prefix has no 128B tail
+    // and VMEM starts 256B-aligned. VMEM absorbs the (≤252B) remainder.
+    size_t K = (p.N / (size_t)nWaves) * (size_t)M;
+    K = (K / 64) * 64;
+    size_t const Kbytes  = K * sizeof(float);
+    size_t const Rfloats = p.N - K;
+    int const    warpId  = (int)(threadIdx.x / warpSize);
+
+    int subIterations = 0;
+    while (1) {
+#if TDM_SUPPORTED
+      if (warpId < M) {
+        // TDM team only — VMEM warps skip this call inside tdmCopyByTeam as well,
+        // but the branch keeps the paths clearly specialized at source level.
+        tdm::tdmCopyByTeam(dst, src, Kbytes, shmem, ldsBytes, 0u, (uint32_t)M);
+      } else {
+        VmemCopySubrange<UNROLL, TEMPORAL_MODE, MEM_SCOPE>(src + K, dst + K, Rfloats, M, nWaves);
+      }
 #else
-  // Neither tensor TDM nor async-to/from-LDS builtins available for this
-  // translation: emit empty kernel stubs with the exact launch signatures so the
-  // host-side launch path still links.
-  __global__ void GpuTdmKernel(SubExecParam*, uint32_t, int, int, int, int, int) {}
+      (void)Kbytes;
+      VmemCopySubrange<UNROLL, TEMPORAL_MODE, MEM_SCOPE>(src, dst, p.N, 0, nWaves);
+#endif
+      if (++subIterations == numSubIterations) break;
+    }
+  }
+
+#else
+  // Host / non-capable arch pass: stub kernel symbols so launches still link.
+  // (TDM_SUPPORTED is device-arch-only; host always takes this branch.)
+  __global__ void GpuTdmKernel(SubExecParam*, uint32_t, int) {}
+  __global__ void GpuAsyncTdmKernel(SubExecParam*, uint32_t, int, int, int, int) {}
+  template <int UNROLL, int TEMPORAL_MODE, int MEM_SCOPE>
+  __global__ void GpuTdmMixKernel(SubExecParam*, uint32_t, int, int) {}
 #endif // TDM_SUPPORTED || ASYNC_COPY_SUPPORTED
+
+  // Host-side mix launch helpers (must live outside TDM_SUPPORTED — that macro is
+  // 0 on the host compile pass). Each selected template specialization is its own
+  // kernel with its own VGPR budget.
+  template <int UNROLL, int TEMPORAL_MODE, int MEM_SCOPE>
+  static ErrResult LaunchGpuTdmMixKernelOne(dim3          gridSize,
+                                            dim3          blockSize,
+                                            uint32_t      ldsBytes,
+                                            hipStream_t   stream,
+                                            hipEvent_t    startEvent,
+                                            hipEvent_t    stopEvent,
+                                            SubExecParam* params,
+                                            int           numSubIterations,
+                                            int           mixTdmWarps)
+  {
+    auto kernel = GpuTdmMixKernel<UNROLL, TEMPORAL_MODE, MEM_SCOPE>;
+#if defined(__NVCC__)
+    if (startEvent != NULL)
+      ERR_CHECK(hipEventRecord(startEvent, stream));
+    kernel<<<gridSize, blockSize, ldsBytes, stream>>>(params, ldsBytes, numSubIterations, mixTdmWarps);
+    if (stopEvent != NULL)
+      ERR_CHECK(hipEventRecord(stopEvent, stream));
+#else
+    hipExtLaunchKernelGGL(kernel, gridSize, blockSize, (int)ldsBytes, stream,
+                          startEvent, stopEvent, 0,
+                          params, ldsBytes, numSubIterations, mixTdmWarps);
+#endif
+    ERR_CHECK(hipGetLastError());
+    return ERR_NONE;
+  }
+
+  template <int UNROLL, int TEMPORAL_MODE>
+  static ErrResult LaunchGpuTdmMixKernelScope(int           memScope,
+                                              dim3          gridSize,
+                                              dim3          blockSize,
+                                              uint32_t      ldsBytes,
+                                              hipStream_t   stream,
+                                              hipEvent_t    startEvent,
+                                              hipEvent_t    stopEvent,
+                                              SubExecParam* params,
+                                              int           numSubIterations,
+                                              int           mixTdmWarps)
+  {
+    switch (memScope) {
+      case 0:
+        return LaunchGpuTdmMixKernelOne<UNROLL, TEMPORAL_MODE, 0>(
+            gridSize, blockSize, ldsBytes, stream, startEvent, stopEvent,
+            params, numSubIterations, mixTdmWarps);
+      case 1:
+        return LaunchGpuTdmMixKernelOne<UNROLL, TEMPORAL_MODE, 1>(
+            gridSize, blockSize, ldsBytes, stream, startEvent, stopEvent,
+            params, numSubIterations, mixTdmWarps);
+      case 2:
+        return LaunchGpuTdmMixKernelOne<UNROLL, TEMPORAL_MODE, 2>(
+            gridSize, blockSize, ldsBytes, stream, startEvent, stopEvent,
+            params, numSubIterations, mixTdmWarps);
+      case 3:
+        return LaunchGpuTdmMixKernelOne<UNROLL, TEMPORAL_MODE, 3>(
+            gridSize, blockSize, ldsBytes, stream, startEvent, stopEvent,
+            params, numSubIterations, mixTdmWarps);
+      default:
+        return LaunchGpuTdmMixKernelOne<UNROLL, TEMPORAL_MODE, -1>(
+            gridSize, blockSize, ldsBytes, stream, startEvent, stopEvent,
+            params, numSubIterations, mixTdmWarps);
+    }
+  }
+
+  template <int UNROLL>
+  static ErrResult LaunchGpuTdmMixKernelTemporal(int           temporalMode,
+                                                 int           memScope,
+                                                 dim3          gridSize,
+                                                 dim3          blockSize,
+                                                 uint32_t      ldsBytes,
+                                                 hipStream_t   stream,
+                                                 hipEvent_t    startEvent,
+                                                 hipEvent_t    stopEvent,
+                                                 SubExecParam* params,
+                                                 int           numSubIterations,
+                                                 int           mixTdmWarps)
+  {
+    switch (temporalMode) {
+      case 1:
+        return LaunchGpuTdmMixKernelScope<UNROLL, 1>(
+            memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 2:
+        return LaunchGpuTdmMixKernelScope<UNROLL, 2>(
+            memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 3:
+        return LaunchGpuTdmMixKernelScope<UNROLL, 3>(
+            memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      default:
+        return LaunchGpuTdmMixKernelScope<UNROLL, 0>(
+            memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+    }
+  }
+
+  static ErrResult LaunchGpuTdmMixKernel(int           hotLoopUnroll,
+                                         int           temporalMode,
+                                         int           memScope,
+                                         dim3          gridSize,
+                                         dim3          blockSize,
+                                         uint32_t      ldsBytes,
+                                         hipStream_t   stream,
+                                         hipEvent_t    startEvent,
+                                         hipEvent_t    stopEvent,
+                                         SubExecParam* params,
+                                         int           numSubIterations,
+                                         int           mixTdmWarps)
+  {
+    switch (hotLoopUnroll) {
+      case 1:
+        return LaunchGpuTdmMixKernelTemporal<1>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 2:
+        return LaunchGpuTdmMixKernelTemporal<2>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 3:
+        return LaunchGpuTdmMixKernelTemporal<3>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 4:
+        return LaunchGpuTdmMixKernelTemporal<4>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 5:
+        return LaunchGpuTdmMixKernelTemporal<5>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 6:
+        return LaunchGpuTdmMixKernelTemporal<6>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 7:
+        return LaunchGpuTdmMixKernelTemporal<7>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 8:
+        return LaunchGpuTdmMixKernelTemporal<8>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 16:
+        return LaunchGpuTdmMixKernelTemporal<16>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 32:
+        return LaunchGpuTdmMixKernelTemporal<32>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 48:
+        return LaunchGpuTdmMixKernelTemporal<48>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 56:
+        return LaunchGpuTdmMixKernelTemporal<56>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      case 64:
+        return LaunchGpuTdmMixKernelTemporal<64>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+      default:
+        return LaunchGpuTdmMixKernelTemporal<4>(
+            temporalMode, memScope, gridSize, blockSize, ldsBytes, stream,
+            startEvent, stopEvent, params, numSubIterations, mixTdmWarps);
+    }
+  }
 
   static ErrResult ExecuteTdmTransfer(int           const  iteration,
                                       int           const  exeTotalSubExecs,
@@ -6140,32 +6432,60 @@ namespace {
     dim3 const blockSize(cfg.tdm.blockSize);
     SubExecParam* params = cfg.general.useMultiStream ? rss.subExecParamGpuPtr : exeSubExecParam;
     int const useAsyncCopy = cfg.tdm.useAsyncCopy ? 1 : 0;
-    // Reuse GFX_UNROLL / GFX_TEMPORAL / GFX_SCOPE for async hot-loop, NT hints, and mem scope.
+    // Reuse GFX_UNROLL / GFX_TEMPORAL / GFX_SCOPE for async hot-loop / mix VMEM half.
     int const hotLoopUnroll = cfg.gfx.unrollFactor > 0 ? cfg.gfx.unrollFactor : 2;
     int const temporalMode  = cfg.gfx.temporalMode;
-    // Unset (-1) keeps prior async default of SYS.
-    int const memScope      = cfg.gfx.memScope >= 0 ? cfg.gfx.memScope : 3;
+    // Unset (-1): async defaults to SYS; mix VMEM half uses legacy (unscoped) loads/stores.
+    int const memScope      = useAsyncCopy
+                              ? (cfg.gfx.memScope >= 0 ? cfg.gfx.memScope : 3)
+                              : cfg.gfx.memScope;
+    int const mixTdmWarps   = cfg.tdm.mixTdmWarps;
+    int const hostWarpSize  = GetWarpSize();
+    int const nWaves        = std::max(1, cfg.tdm.blockSize / hostWarpSize);
+    // True mix only when some warps are TDM and some are VMEM.
+    bool const useMix       = (!useAsyncCopy && mixTdmWarps > 0 && mixTdmWarps < nWaves);
 
     auto cpuStart = std::chrono::high_resolution_clock::now();
 
 #if defined(__NVCC__)
-    if (cfg.general.useHipEvents)
-      ERR_CHECK(hipEventRecord(startEvent, stream));
-    GpuTdmKernel<<<gridSize, blockSize, ldsBytes, stream>>>(params,
-                                                            ldsBytes,
-                                                            cfg.general.numSubIterations,
-                                                            useAsyncCopy,
-                                                            hotLoopUnroll,
-                                                            temporalMode,
-                                                            memScope);
-    if (cfg.general.useHipEvents)
-      ERR_CHECK(hipEventRecord(stopEvent, stream));
+    if (useMix) {
+      // Launch helper owns event records for the templated mix kernel.
+      ERR_CHECK(LaunchGpuTdmMixKernel(hotLoopUnroll, temporalMode, memScope,
+                                      gridSize, blockSize, ldsBytes, stream,
+                                      startEvent, stopEvent, params,
+                                      cfg.general.numSubIterations, mixTdmWarps));
+    } else {
+      if (cfg.general.useHipEvents)
+        ERR_CHECK(hipEventRecord(startEvent, stream));
+      if (useAsyncCopy) {
+        GpuAsyncTdmKernel<<<gridSize, blockSize, ldsBytes, stream>>>(
+            params, ldsBytes, cfg.general.numSubIterations,
+            hotLoopUnroll, temporalMode, memScope);
+      } else {
+        GpuTdmKernel<<<gridSize, blockSize, ldsBytes, stream>>>(
+            params, ldsBytes, cfg.general.numSubIterations);
+      }
+      if (cfg.general.useHipEvents)
+        ERR_CHECK(hipEventRecord(stopEvent, stream));
+    }
 #else
-    hipExtLaunchKernelGGL(GpuTdmKernel, gridSize, blockSize, (int)ldsBytes, stream,
-                          startEvent, stopEvent, 0,
-                          params, ldsBytes, cfg.general.numSubIterations,
-                          useAsyncCopy, hotLoopUnroll, temporalMode, memScope);
+    if (useAsyncCopy) {
+      hipExtLaunchKernelGGL(GpuAsyncTdmKernel, gridSize, blockSize, (int)ldsBytes, stream,
+                            startEvent, stopEvent, 0,
+                            params, ldsBytes, cfg.general.numSubIterations,
+                            hotLoopUnroll, temporalMode, memScope);
+    } else if (useMix) {
+      ERR_CHECK(LaunchGpuTdmMixKernel(hotLoopUnroll, temporalMode, memScope,
+                                      gridSize, blockSize, ldsBytes, stream,
+                                      startEvent, stopEvent, params,
+                                      cfg.general.numSubIterations, mixTdmWarps));
+    } else {
+      hipExtLaunchKernelGGL(GpuTdmKernel, gridSize, blockSize, (int)ldsBytes, stream,
+                            startEvent, stopEvent, 0,
+                            params, ldsBytes, cfg.general.numSubIterations);
+    }
 #endif
+    ERR_CHECK(hipGetLastError());
     ERR_CHECK(hipStreamSynchronize(stream));
 
     // Record this timing if this Transfer is being run in multistream mode
@@ -6233,10 +6553,10 @@ namespace {
         ERR_CHECK(asyncTransfer.get());
     } else {
       // Launch all Transfers in one kernel launch (avoid extra thread creation)
-      ExecuteTdmTransfer(iteration, exeInfo.totalSubExecs, exeInfo.subExecParamGpu, exeInfo.streams[0],
-                         cfg.general.useHipEvents ? exeInfo.startEvents[0] : NULL,
-                         cfg.general.useHipEvents ? exeInfo.stopEvents[0] : NULL,
-                         cfg, exeInfo.subExecParamHostAccessible, exeInfo.ldsBytesActual, exeInfo.resources[0]);
+      ERR_CHECK(ExecuteTdmTransfer(iteration, exeInfo.totalSubExecs, exeInfo.subExecParamGpu, exeInfo.streams[0],
+                                   cfg.general.useHipEvents ? exeInfo.startEvents[0] : NULL,
+                                   cfg.general.useHipEvents ? exeInfo.stopEvents[0] : NULL,
+                                   cfg, exeInfo.subExecParamHostAccessible, exeInfo.ldsBytesActual, exeInfo.resources[0]));
     }
 
     if (iteration >= 0) {

@@ -209,6 +209,39 @@ Remote-read:
 
 **Output (example):** `transferbench_ffm_async_write_GBS_256_UNROLL_32_NSE_80_TEMP_3_SCOPE_SYS_A2A_256M_2nproc_rank0.cap`
 
+## Mixed TDM + VMEM (wave split)
+
+Same transfer size `N` as pure TDM or pure VMEM. With `USE_TDM_EXEC=1` and
+`MIX_TDM_WARPS=M` (`0 < M < nWaves`), each TG splits warps via a dedicated
+`GpuTdmMixKernel` (separate from pure `GpuTdmKernel` / `GpuAsyncTdmKernel` so
+VGPR budgets are not merged across unused paths):
+
+- warps `[0, M)` → tensor TDM via `tdm::tdmCopyByTeam` on the first `K` floats
+- warps `[M, nWaves)` → VMEM packed copy on the remaining `N-K` floats
+
+`K = (N / nWaves) * M` (aligned down to 64 floats / 256B so TDM has no sub-row
+tail; VMEM absorbs the remainder). `TDM_BLOCK_SIZE=256` → 8 waves;
+`MIX_TDM_WARPS=2` → ~25% TDM / ~75% VMEM. Async path ignores mix (tensor-TDM only).
+Default `--disp` for mix is `GpuTdmMixKernel/0-`.
+
+```bash
+./scripts/roccap_capture.py \
+  --use-tdm-exec \
+  --mix-tdm-warps 2 \
+  --num-gpu-devices 2 \
+  --tb-sim-heap-bytes 768M \
+  --num-iterations 1 \
+  --num-warmups 0 \
+  --gfx-block-size 256 \
+  --num-sub-exec 8 \
+  --dispatchlog \
+  --output-dir caps_mix \
+  a2a 32M
+```
+
+**Output (example):** `transferbench_ffm_tdm_write_GBS_256_UNROLL_32_NSE_8_TEMP_3_MIX_TW_2_A2A_32M_2nproc_rank0.cap`
+(Mixed names also include `UNROLL_*` / `TEMP_*` / `SCOPE_*` for the VMEM half when those flags are set.)
+
 ## Key environment variables
 
 | Variable | Purpose |
@@ -226,6 +259,7 @@ Remote-read:
 | `USE_HSA_DMA=1` | HSA async copy instead of hipMemcpy (optional `--use-hsa-dma`) |
 | `USE_ASYNC_EXEC=1` | Async-to/from-LDS via `GpuTdmKernel` (set by `--use-async-exec`) |
 | `USE_ASYNC_COPY=1` | Select async backend inside TDM executor (also set by `--use-async-exec`) |
+| `MIX_TDM_WARPS=M` | With TDM: first M warps tensor-TDM, rest VMEM (same N; set by `--mix-tdm-warps`) |
 
 Do **not** set `TB_ROCCAP_FAST_EXIT=1` — it truncates caps on FFM.
 

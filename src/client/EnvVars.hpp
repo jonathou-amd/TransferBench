@@ -132,6 +132,7 @@ public:
   int tdmBlockSize;                  // Size of each threadblock for TDM kernels (must be multiple of 32)
   int tdmLdsBytes;                   // Size of LDS (shared memory) bytes per threadblock for TDM kernels (0 = use device max)
   int tdmUseAsyncCopy;               // 0=tensor TDM; 1=async-to/from-LDS copy backend inside GpuTdmKernel
+  int tdmMixTdmWarps;                // 0=all warps TDM; M>0: first M warps tensor-TDM, rest VMEM (same N)
 
   // Developer features
   int gpuMaxHwQueues;                // Tracks GPU_MAX_HW_QUEUES environment variable
@@ -189,6 +190,7 @@ public:
     tdmBlockSize      = GetEnvVar("TDM_BLOCK_SIZE"      , 256);
     tdmLdsBytes       = GetEnvVar("TDM_LDS_BYTES"       , 0);
     tdmUseAsyncCopy   = GetEnvVar("USE_ASYNC_COPY"      , 0);
+    tdmMixTdmWarps    = GetEnvVar("MIX_TDM_WARPS"       , 0);
     useHipEvents      = GetEnvVar("USE_HIP_EVENTS"      , 1);
     useHsaDma         = GetEnvVar("USE_HSA_DMA"         , 0);
     useInteractive    = GetEnvVar("USE_INTERACTIVE"     , 0);
@@ -415,6 +417,7 @@ public:
     printf(" TDM_BLOCK_SIZE      - # of threads per threadblock for TDM (async tensor) kernels (Must be multiple of 32)\n");
     printf(" TDM_LDS_BYTES       - Amount of LDS bytes to allocate per workgroup for TDM kernels (0 = device max; K/M/G suffixes accepted)\n");
     printf(" USE_ASYNC_COPY      - Use async-to/from-LDS backend inside GpuTdmKernel (1) instead of tensor TDM (0)\n");
+    printf(" MIX_TDM_WARPS       - With USE_TDM_EXEC: first M warps tensor-TDM, remaining warps VMEM on complementary ranges (same N; 0=off)\n");
     printf(" USE_HIP_EVENTS      - Use HIP events for GFX executor timing\n");
     printf(" USE_HIP_EVENTS      - Use HIP events for GFX/DMA/TDM executor timing (0=CPU wall-clock)\n");
     printf(" USE_HSA_DMA         - Use hsa_amd_async_copy instead of hipMemcpy for non-targeted DMA execution\n");
@@ -573,6 +576,10 @@ public:
           : (std::string("Setting LDS to ") + std::to_string(tdmLdsBytes) + " bytes per workgroup").c_str());
     Print("USE_ASYNC_COPY", tdmUseAsyncCopy,
           "Using %s LDS-staged copy backend", tdmUseAsyncCopy ? "async-to/from-LDS" : "tensor TDM");
+    Print("MIX_TDM_WARPS", tdmMixTdmWarps,
+          tdmMixTdmWarps > 0
+            ? "First M warps tensor-TDM, remaining warps VMEM (same N)"
+            : "Disabled (all warps use TDM/async backend)");
     Print("USE_HIP_EVENTS", useHipEvents,
           "Using %s for GFX/DMA/TDM Executor timing", useHipEvents ? "HIP events" : "CPU wall time");
     Print("USE_HSA_DMA", useHsaDma,
@@ -785,6 +792,7 @@ public:
     cfg.tdm.blockSize              = tdmBlockSize;
     cfg.tdm.ldsBytes               = tdmLdsBytes;
     cfg.tdm.useAsyncCopy           = tdmUseAsyncCopy;
+    cfg.tdm.mixTdmWarps            = tdmMixTdmWarps;
 
     return cfg;
   }

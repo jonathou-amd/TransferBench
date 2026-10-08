@@ -133,9 +133,18 @@ int AllToAllPreset(EnvVars&          ev,
       ev.Print("USE_DMA_EXEC"   , useDmaExec   , "Using %s executor", useDmaExec ? "DMA" : "GFX");
       ev.Print("USE_TDM_EXEC"   , useTdmExec && !useAsyncExec, "Using %s executor", (useTdmExec && !useAsyncExec) ? "TDM" : "GFX");
       ev.Print("USE_ASYNC_EXEC" , useAsyncExec , "Using %s executor", useAsyncExec ? "ASYNC (async-to/from-LDS)" : "GFX");
+      ev.Print("MIX_TDM_WARPS"  , ev.tdmMixTdmWarps,
+               ev.tdmMixTdmWarps > 0
+                 ? "Split TG: first M warps tensor-TDM, rest VMEM (same N; requires USE_TDM_EXEC)"
+                 : "Disabled (pure TDM/async/GFX path)");
       ev.Print("USE_REMOTE_READ", useRemoteRead, "Using %s as executor", useRemoteRead ? "DST" : "SRC");
       printf("\n");
     }
+  }
+  if (ev.tdmMixTdmWarps > 0 && useAsyncExec) {
+    Utils::Print("[WARN] MIX_TDM_WARPS ignored with USE_ASYNC_EXEC (tensor-TDM + VMEM mix only)\n");
+  } else if (ev.tdmMixTdmWarps > 0 && !useTdmExec) {
+    Utils::Print("[WARN] MIX_TDM_WARPS set but USE_TDM_EXEC=0; mix only applies on the TDM executor\n");
   }
   // Validate env vars
   if (numGpus < 0 || numGpus > numDetectedGpus) {

@@ -162,16 +162,19 @@ def build_capture_basename(args: argparse.Namespace) -> str:
             parts.append(format_lds_basename_tag(lds_raw, lds_val))
         if args.gfx_block_size is not None:
             parts.append(f"GBS_{args.gfx_block_size}")
-        # Async hot-loop unroll / temporal reuse --gfx-unroll / --gfx-temporal (same as VMEM).
-        if args.use_async_exec:
+        # Async always tags unroll/temporal (hot-loop). Mixed TDM tags them for the VMEM half.
+        is_mix = (not args.use_async_exec) and args.mix_tdm_warps is not None and args.mix_tdm_warps > 0
+        if args.use_async_exec or is_mix:
             unroll = 2 if args.gfx_unroll is None else args.gfx_unroll
             parts.append(f"UNROLL_{unroll}")
         if args.num_sub_exec is not None:
             parts.append(f"NSE_{args.num_sub_exec}")
-        if args.use_async_exec and args.gfx_temporal is not None:
+        if (args.use_async_exec or is_mix) and args.gfx_temporal is not None:
             parts.append(f"TEMP_{args.gfx_temporal}")
         if args.gfx_scope is not None and args.gfx_scope >= 0:
             parts.append(f"SCOPE_{scope_basename_tag(args.gfx_scope)}")
+        if is_mix:
+            parts.append(f"MIX_TW_{args.mix_tdm_warps}")
         parts.append(f"{args.preset.upper()}_{args.transfer_size}")
         return "_".join(parts)
 
@@ -202,7 +205,12 @@ def build_disp_filter(args: argparse.Namespace) -> str:
         return f"{args.kernel_regex}/0-"
     if args.use_dma_exec:
         return "0-"
-    if args.use_async_exec or args.use_tdm_exec:
+    if args.use_async_exec:
+        return "GpuAsyncTdmKernel/0-"
+    if args.use_tdm_exec:
+        # Mix launches GpuTdmMixKernel; pure TDM launches GpuTdmKernel.
+        if args.mix_tdm_warps is not None and args.mix_tdm_warps > 0:
+            return "GpuTdmMixKernel/0-"
         return "GpuTdmKernel/0-"
     return DEFAULT_DISP_GFX
 
@@ -281,6 +289,8 @@ def apply_env(args: argparse.Namespace, heap_prefix: str) -> dict[str, str]:
         env["USE_ASYNC_COPY"] = "1"
     if args.use_tdm_exec:
         env["USE_TDM_EXEC"] = "1"
+    if args.mix_tdm_warps is not None:
+        env["MIX_TDM_WARPS"] = str(args.mix_tdm_warps)
     if args.tdm_lds_bytes is not None:
         env["TDM_LDS_BYTES"] = str(parse_size_bytes(args.tdm_lds_bytes))
     if args.use_remote_read is not None:
@@ -562,6 +572,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Mutually exclusive with --use-tdm-exec / --use-dma-exec.",
     )
     bench.add_argument(
+        "--mix-tdm-warps",
+        type=int,
+        default=None,
+        metavar="M",
+        help="MIX_TDM_WARPS: with --use-tdm-exec, first M warps run tensor TDM and the rest VMEM on "
+        "complementary byte ranges of the same transfer (same N). Ignored for async. "
+        "Adds MIX_TW_M to TDM cap basenames when M>0.",
+    )
+    bench.add_argument(
         "--tdm-lds-bytes",
         default=None,
         metavar="SIZE",
@@ -604,6 +623,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.use_async_exec and args.use_tdm_exec:
         print("[WARN] Both --use-async-exec and --use-tdm-exec set; using async", file=sys.stderr)
         args.use_tdm_exec = False
+
+    if args.mix_tdm_warps is not None and args.mix_tdm_warps > 0:
+        if args.use_async_exec:
+            print("[WARN] --mix-tdm-warps ignored with --use-async-exec (tensor-TDM mix only)",
+                  file=sys.stderr)
+        elif not args.use_tdm_exec:
+            print("[WARN] --mix-tdm-warps requires --use-tdm-exec; enabling TDM executor",
+                  file=sys.stderr)
+            args.use_tdm_exec = True
 
     setup_ffm_paths()
     os.chdir(REPO_ROOT)
